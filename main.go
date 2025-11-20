@@ -13,7 +13,7 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		err := svc.Browse(ctx, "_EasyConn._tcp", "local.")
+		err := svc.Browse(ctx, "_EasyConn._tcp", "local")
 		if err != nil {
 			log.Fatal(err)
 		}
