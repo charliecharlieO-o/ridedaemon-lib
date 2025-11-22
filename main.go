@@ -20,8 +20,9 @@ func main() {
 		}
 	}()
 
+	var ip string
 	reService := regexp.MustCompile("^packagename=com.cfmoto.cfmotointernational$")
-	reIP := regexp.MustCompile("^ip=.*$")
+	reIP := regexp.MustCompile("^ip=(.*)$")
 	for entry := range entries {
 		log.Println("FOUND:", entry.HostName, entry.Port)
 		for _, i := range entry.Text {
@@ -29,11 +30,11 @@ func main() {
 				log.Println("Found CFMOTO service")
 			}
 			if reIP.MatchString(i) {
-				sub := reService.FindStringSubmatch(i)
+				sub := reIP.FindStringSubmatch(i)
 				log.Println("Found CFMOTO service IP at:", sub[1])
+				ip = sub[1]
 			}
 		}
 	}
-
 	cancel()
 }
