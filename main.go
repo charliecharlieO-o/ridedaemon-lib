@@ -2,8 +2,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"log"
+	"regexp"
 )
 
 func main() {
@@ -20,12 +20,18 @@ func main() {
 		}
 	}()
 
+	reService := regexp.MustCompile("^packagename=com.cfmoto.cfmotointernational$")
+	reIP := regexp.MustCompile("^ip=.*$")
 	for entry := range entries {
 		log.Println("FOUND:", entry.HostName, entry.Port)
-		if jsonP, err := json.Marshal(entry); err != nil {
-			log.Println(err)
-		} else {
-			log.Println(string(jsonP))
+		for _, i := range entry.Text {
+			if reService.MatchString(i) {
+				log.Println("Found CFMOTO service")
+			}
+			if reIP.MatchString(i) {
+				sub := reService.FindStringSubmatch(i)
+				log.Println("Found CFMOTO service IP at:", sub[1])
+			}
 		}
 	}
 
