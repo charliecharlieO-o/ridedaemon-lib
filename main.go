@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 )
 
@@ -21,6 +22,11 @@ func main() {
 
 	for entry := range entries {
 		log.Println("FOUND:", entry.HostName, entry.Port)
+		if jsonP, err := json.Marshal(entry); err != nil {
+			log.Println(err)
+		} else {
+			log.Println(string(jsonP))
+		}
 	}
 
 	cancel()
