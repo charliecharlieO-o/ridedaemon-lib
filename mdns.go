@@ -77,7 +77,6 @@ func (s *MDNSService) Browse(ctx context.Context, service string, domain string)
 	}
 
 	<-ctx.Done()
-	close(s.entries)
 	close(s.stop)
 	atomic.StoreInt32(&s.looking, 0)
 
