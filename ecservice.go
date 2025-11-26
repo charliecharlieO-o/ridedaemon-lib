@@ -15,7 +15,7 @@ const initOk int = 17
 
 type ECResponse struct {
 	Code      int
-	Separator byte
+	Separator uint16
 	Size      int
 	Magic     int
 	Body      []byte
@@ -32,18 +32,18 @@ func NewECService(ip, port, packageName, phoneType string) *ECService {
 	return &ECService{ip, port, packageName, phoneType}
 }
 
-func (s *ECService) encodePayload(payload []byte) []byte {
-	ttlLen := len(payload) + 16
+func (s *ECService) encodePayload(payload *ECResponse) []byte {
+	ttlLen := len(payload.Body) + 16
 	magic := ttlLen ^ 16 // 16 is the header size
 	header := make([]byte, 16)
 
-	binary.LittleEndian.PutUint16(header[0:], uint16(initCmd))
-	binary.LittleEndian.PutUint16(header[3:], 0x70)
+	binary.LittleEndian.PutUint16(header[0:], uint16(payload.Code))
+	binary.LittleEndian.PutUint16(header[3:], payload.Separator)
 	binary.LittleEndian.PutUint16(header[4:], uint16(ttlLen))
 	binary.LittleEndian.PutUint16(header[8:], uint16(magic))
-	binary.LittleEndian.PutUint16(header[11:], 0x70)
+	binary.LittleEndian.PutUint16(header[11:], payload.Separator)
 
-	return append(header, payload...)
+	return append(header, payload.Body...)
 }
 
 func (s *ECService) decodePayload(payload []byte) (*ECResponse, error) {
@@ -64,7 +64,7 @@ func (s *ECService) decodePayload(payload []byte) (*ECResponse, error) {
 	// Process header
 	response.Code = int(header[0])
 	response.Size = int(header[4])
-	response.Separator = header[11]
+	response.Separator = uint16(header[11])
 	response.Magic = int(header[8])
 
 	// Process body
@@ -100,7 +100,11 @@ func (s *ECService) Start() error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal init payload: %s", err)
 	}
-	payload = s.encodePayload(payload)
+	payload = s.encodePayload(&ECResponse{
+		Code:      initCmd,
+		Separator: 0x70,
+		Body:      payload,
+	})
 
 	// Write init payload over tcp
 	if _, err = conn.Write(payload); err != nil {
