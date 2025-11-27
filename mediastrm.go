@@ -49,6 +49,19 @@ func (s *MediaStream) acceptLoop() {
 			}
 		}
 
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			err = tcpConn.SetNoDelay(true)
+			if err != nil {
+				<-s.quit
+				return
+			}
+			err = tcpConn.SetKeepAlive(true)
+			if err != nil {
+				<-s.quit
+				return
+			}
+		}
+
 		log.Printf("New MediaStream client from %s", conn.RemoteAddr())
 		s.wg.Add(1)
 		go s.handleConn(conn)
@@ -134,6 +147,7 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 				log.Printf("flush error: %s", err)
 				continue
 			}
+			log.Printf("Media Stream idx: %d", idx)
 			idx++
 			if idx >= len(stock) {
 				idx = 0
