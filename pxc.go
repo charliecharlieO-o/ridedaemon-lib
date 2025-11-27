@@ -337,12 +337,10 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 			request = req
 		}
 
-		// Sanity check...most...commands
-		if request.Command != SpeedConf && request.Command != SpeedOk && request.Command != ClientSet {
-			if request.Magic != request.Command+request.Size {
-				log.Printf("Sanity check failed: %d %d", request.Magic, request.Command)
-				return
-			}
+		// Sanity check
+		if request.Magic != request.Size^request.Command {
+			log.Printf("Sanity check failed: %d %d", request.Magic, request.Command)
+			return
 		}
 
 		// Read event body if size is greater than 0
