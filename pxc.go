@@ -14,24 +14,29 @@ import (
 	"sync"
 )
 
-const headerSize = 16
+// This protocol is not so weird, it has a 16 byte header plus payload
+// standard little endian order and some simple checks, the client (bike)
+// establishes connection 2 times, so it's normal for one connection to drop
+// after setting up the speed configuration.
+
+const pxcHeaderSize = 16
 
 // Command requests
 const (
-	Handshake uint32 = 65536
-	HudConf   uint32 = 65552
-	SpeedConf uint32 = 67216
-	Heartbeat uint32 = 1879048192
-	ClientSet uint32 = 66528
+	PxcHandshake uint32 = 65536
+	PxcHudConf   uint32 = 65552
+	PxcSpeedConf uint32 = 67216
+	PxcHeartbeat uint32 = 1879048192
+	PxcClientSet uint32 = 66528
 )
 
 // Command responses
 const (
-	HandshakeOk uint32 = 65537
-	PhoneConf   uint32 = 65553
-	SpeedOk     uint32 = 67217
-	HeartbeatOk uint32 = 1879048193
-	ClientOk    uint32 = 66529
+	PxcHandshakeOk uint32 = 65537
+	PxcPhoneConf   uint32 = 65553
+	PxcSpeedOk     uint32 = 67217
+	PxcHeartbeatOk uint32 = 1879048193
+	PxcClientOk    uint32 = 66529
 )
 
 type PXCResponse struct {
@@ -141,7 +146,7 @@ func NewPXCControl(port string, kp *KeyPair, config *PhoneConfig) *PXCControl {
 }
 
 func (s *PXCControl) decodeHeader(payload []byte) (*PXCResponse, error) {
-	if len(payload) < headerSize {
+	if len(payload) < pxcHeaderSize {
 		return nil, errors.New("invalid header")
 	}
 	return &PXCResponse{
@@ -180,8 +185,8 @@ func (s *PXCControl) buildPC() error {
 func (s *PXCControl) writeResponse(res *PXCResponse, conn net.Conn, raw *[]byte) error {
 	if raw == nil && res != nil {
 		// -- build header
-		res.Token = 0 // Token is always 0 for responses
-		res.Size = headerSize
+		res.Token = 0 // Padding is always 0 for responses
+		res.Size = pxcHeaderSize
 		if len(res.Body) > 0 {
 			res.Size = res.Size + uint32(len(res.Body))
 		}
@@ -208,7 +213,6 @@ func (s *PXCControl) writeResponse(res *PXCResponse, conn net.Conn, raw *[]byte)
 			}
 		}
 	} else if raw != nil {
-		fmt.Printf("\nOutput Bytes: %x\n", *raw)
 		if _, err := conn.Write(*raw); err != nil {
 			return err
 		}
@@ -219,15 +223,16 @@ func (s *PXCControl) writeResponse(res *PXCResponse, conn net.Conn, raw *[]byte)
 
 func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 	switch event.Command {
-	case Handshake:
-		response := &PXCResponse{Command: HandshakeOk}
+	case PxcHandshake:
+		response := &PXCResponse{Command: PxcHandshakeOk}
 		if err := s.writeResponse(response, conn, nil); err != nil {
 			s.Errors <- err
 		}
-	case HudConf:
+	case PxcHudConf:
 		if s.HudConfig != nil {
 			break
 		}
+		s.Events <- *event
 		// Read HudConfig and store it
 		var conf HUDConfig
 		if err := json.Unmarshal(event.Body, &conf); err != nil {
@@ -242,24 +247,28 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 		if b, err := json.Marshal(s.PhoneConfig); err != nil {
 			s.Errors <- err
 		} else {
-			response := &PXCResponse{Command: PhoneConf, Body: b}
+			response := &PXCResponse{Command: PxcPhoneConf, Body: b}
 			if err = s.writeResponse(response, conn, nil); err != nil {
 				s.Errors <- err
 				break
 			}
+			s.Events <- *response
 		}
-	case SpeedConf:
-		response := &PXCResponse{Command: SpeedOk}
+	case PxcSpeedConf:
+		s.Events <- *event
+		response := &PXCResponse{Command: PxcSpeedOk}
 		if err := s.writeResponse(response, conn, nil); err != nil {
 			s.Errors <- err
 		}
-	case ClientSet:
-		response := &PXCResponse{Command: ClientOk}
+	case PxcClientSet:
+		s.Events <- *event
+		response := &PXCResponse{Command: PxcClientOk}
 		if err := s.writeResponse(response, conn, nil); err != nil {
 			s.Errors <- err
 		}
-	case Heartbeat:
-		response := &PXCResponse{Command: HeartbeatOk}
+	case PxcHeartbeat:
+		s.Events <- *event
+		response := &PXCResponse{Command: PxcHeartbeatOk}
 		if err := s.writeResponse(response, conn, nil); err != nil {
 			s.Errors <- err
 		}
@@ -325,7 +334,7 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 		var request *PXCResponse
 
 		// Read the 16 byte header
-		headerBytes := make([]byte, headerSize)
+		headerBytes := make([]byte, pxcHeaderSize)
 		if n, err := io.ReadFull(reader, headerBytes); err != nil {
 			s.Errors <- fmt.Errorf("error reading header: %v (read %d bytes: %x)", err, n, headerBytes[:n])
 			return
@@ -346,9 +355,9 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 		// Read event body if size is greater than 0
 		var payload []byte
 		if request.Size > 0 {
-			payload = make([]byte, request.Size-headerSize)
+			payload = make([]byte, request.Size-pxcHeaderSize)
 			if _, err := io.ReadFull(reader, payload); err != nil {
-				log.Printf("[TCPService] read payload failed from %s: %v", conn.RemoteAddr(), err)
+				s.Errors <- fmt.Errorf("[PXCService] read payload failed from %s: %v", conn.RemoteAddr(), err)
 				return
 			}
 			request.Body = payload
@@ -371,7 +380,7 @@ func (s *PXCControl) Stop(ctx context.Context) error {
 	}
 
 	// Wait for all goroutines
-	done := make(chan struct{})
+	done := make(chan any)
 	go func() {
 		s.wg.Wait()
 		close(done)
