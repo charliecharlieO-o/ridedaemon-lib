@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -80,8 +81,15 @@ func SearchForService(ctx context.Context) *Host {
 }
 
 func main() {
-	ctx, cancel := context.WithCancel(context.Background())
+	// Load no signal stream service
+	noSigSrc, err := NewNoSignalSource("./static.h264", 15)
+	if err != nil {
+		log.Fatalf("Failed to create no signal source: %v", err)
+	} else {
+		log.Println("Signal source created")
+	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	host := SearchForService(ctx)
 
 	if host != nil {
@@ -178,7 +186,7 @@ func main() {
 		}()
 
 		// Create Media Stream Server - This service is the one that sends H264 stream data
-		mediaStream := NewMediaStream(":10920")
+		mediaStream := NewMediaStream(":10920", noSigSrc, 0x1000, 3*time.Millisecond)
 
 		defer func(s *MediaStream, ctx context.Context) {
 			err := mediaStream.Stop(ctx)

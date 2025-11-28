@@ -4,33 +4,102 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"io"
 	"log"
 	"net"
 	"sync"
+	"time"
 )
 
-// Step frame 72 00 00 00 00 00 00 00 - 8 bytes
+type FrameSource interface {
+	NextFrame(now time.Time) ([]byte, error)
+}
 
+type connectionState struct {
+	frameCounter uint32
+	pollCount    uint64
+}
+
+func buildFramedPacket(body []byte, frameCounter uint32) ([]byte, uint32) {
+	idx := frameCounter
+
+	// 4B index
+	idxBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(idxBytes, idx)
+
+	// 4B len
+	totalLen := uint32(len(idxBytes) + len(body))
+	lenBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(lenBytes, totalLen)
+
+	// data
+	frame := make([]byte, 0, mediaStepFrameSize+len(body))
+	frame = append(frame, lenBytes...)
+	frame = append(frame, idxBytes...)
+	frame = append(frame, body...)
+
+	return frame, idx
+}
+
+func sendChunked(w *bufio.Writer, frame []byte, chunkSize int, sleep time.Duration) error {
+	// no chunking needed
+	if chunkSize <= 0 {
+		if _, err := w.Write(frame); err != nil {
+			return err
+		}
+		return w.Flush()
+	}
+
+	offset := 0
+	for offset < len(frame) {
+		end := offset + chunkSize
+		if end > len(frame) {
+			end = len(frame)
+		}
+
+		// Write chunk :p
+		if _, err := w.Write(frame[offset:end]); err != nil {
+			return err
+		}
+		if err := w.Flush(); err != nil {
+			return err
+		}
+
+		offset = end
+		if sleep > 0 {
+			time.Sleep(sleep)
+		}
+	}
+	return nil
+}
+
+// Step frame 72 00 00 00 00 00 00 00 - 8 bytes
 const mediaStepFrameSize = 8
 
 type MediaStream struct {
-	port string
-	quit chan any
-
+	port     string
+	quit     chan any
 	wg       sync.WaitGroup
 	listener net.Listener
+	Errors   chan error
 
-	Errors chan error
+	// Shared frame source (temp)
+	src FrameSource
+
+	// Config
+	chunkSize  int           // e.g 0x1000
+	chunkSleep time.Duration // e.g 3 * time.Millisecond
 }
 
-func NewMediaStream(port string) *MediaStream {
+func NewMediaStream(port string, src FrameSource, chunkSize int, chunkSleep time.Duration) *MediaStream {
 	return &MediaStream{
-		port:   port,
-		quit:   make(chan any),
-		Errors: make(chan error),
+		port:       port,
+		quit:       make(chan any),
+		Errors:     make(chan error),
+		src:        src,
+		chunkSize:  chunkSize,
+		chunkSleep: chunkSleep,
 	}
 }
 
@@ -49,28 +118,9 @@ func (s *MediaStream) acceptLoop() {
 			}
 		}
 
-		if tcpConn, ok := conn.(*net.TCPConn); ok {
-			err = tcpConn.SetNoDelay(true)
-			if err != nil {
-				<-s.quit
-				return
-			}
-			err = tcpConn.SetKeepAlive(true)
-			if err != nil {
-				<-s.quit
-				return
-			}
-		}
-
 		log.Printf("New MediaStream client from %s", conn.RemoteAddr())
 		s.wg.Add(1)
 		go s.handleConn(conn)
-	}
-}
-
-func (s *MediaStream) handleTick(conn net.Conn) {
-	if _, err := conn.Write([]byte{0, 0, 0, 0}); err != nil {
-		s.Errors <- err
 	}
 }
 
@@ -79,79 +129,97 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 	defer s.wg.Done()
 	defer func(conn net.Conn) {
 		if err := conn.Close(); err != nil {
-			log.Printf("Error closing connection: %v", err)
+			log.Printf("MediaStream: Error closing connection: %v", err)
 		}
 	}(conn)
 
-	// Match your Kotlin buffering:
+	// Keep a fast & stead connection
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
+		_ = tcpConn.SetKeepAlive(true)
+	}
+
 	input := bufio.NewReaderSize(conn, 8*1024)
 	output := bufio.NewWriterSize(conn, 64*1024)
-	defer func(output *bufio.Writer) {
-		err := output.Flush()
-		if err != nil {
-			log.Printf("Error flushing output on exit: %v", err)
+	defer func() {
+		if err := output.Flush(); err != nil {
+			log.Printf("MediaStream: Error flushing output: %v", err)
 		}
-	}(output) // best effort on exit
+	}()
 
-	hdr := make([]byte, 8)
-	zero4 := []byte{0x00, 0x00, 0x00, 0x00}
+	header := make([]byte, mediaStepFrameSize)
+	zero4 := []byte{0, 0, 0, 0}
 
-	stock := []string{
-		"1b040000000000016764001facb406418d35020202078a15500000000168ee0d8b000000016764001facb406418d35020202078a15500000000168ee0d8b0000000165b823b48e7bd4cddff847ff3d15df0de3569a287d372a6e140000030000030000030000ee255c01d66000070084dbbb5221b00498da0d54600f703a80d8048817006200000300000300000300000300000300000300010097b983db79d5b71ee07268372951f0d99b4b1ebf77cda910d1c77a863bd0915f1eae067fe225fb50758926f507262df80557373f9576e432753280754f2c918050f49f8dffb9a7513b6521d0bee2df02c15169ecf3e21b89c1b26c60acb3fdd0cf981419c605bdfc32e0860f912c5b52a222eb2a421869c68bd9d1c38d3451a9c9587ff9d0599150b388a59debfe701881e6cc666e390613a02eca047a878305fbe42ce154354b11cc49dcb40d056a3b63c11388a5819412f96a549f9841eb963f7f97f2db27fffffa7cd6e88f6479aefec2a673a6b71a58697139ca6806879f829e772ade53d4b0185ac4d73f9bde05e07fba67c2c10c8f0246ddf8b068c3d9b6e8fef829d3b79c219f3f0d11504cc4d9899265ddfa732b834afe81e77b3a7aec488acaedc88724ef37e8217fff4f957f99646314df1a58e457bb265a75fdd866e9319c9d2c7917cfa173e3da6f525da57ca0ea75a5210006c2d4167e1d0ee031e4d8fc6bc8068301a7b416df4ff65cf4e324d33efc59bdc9c24fb09be727de5900bb950293756bc6e98b73a696a4130a8ca628d088d01101ef180163d0aaedd98fd28032af0e36ef7efc76aea7f94d6be9b0f21ac6fb4560f9e70898876fe9fecfcfb5cc3e3ed315fc8ec54be343888d5eea992e799ac8d833f374682c19aba363fa515586440aef0ea62c7b01d7175e46ec1621943c1b331d35d3cfd29e1aa43ef215dc73fb7815a118dbc193aaf10a70976e796b2a8378645ecbd2c1a9b15dda8187c39b981fe9206cf2e8b9283c08743074cb0905c9218336ea3baeb23044e3244810b5477e759debee5431c098d043ba008dacc5792a5f280f47e1398899ff61914e86f21cbfb4f8fcf42006a32a1b6c89882dbd5d2a9d16f314576f27f88485816425581a420ce813aff84a5f9c66e1972b8cfe4e0cf112b1140a6784d0a5cf4c9d2d067d889d02fbae7e119bf396cc64ba02dee0e7aea3fb42274c3ff17bce7e0e0d2535adee94f0faae8128bc7c3394b0661879d34e27ec3fee87ce150378bada3ef81b5fba59c1ffbfa91e9e096131e461d5612b7984425b03fafd6a63245440f3b59bb63b1b68b9a36070c13596549ec2867c607156763a96544e88d9ff05008a0d7cf1cc4b7b01f497ffe5d75743f704b680aa4a90534cb32df21cf2f66ab55ad7aec2d97114edc3e5037de9156b29b6bc55cd670b8eef9d331284161a8f54648659408f776fc2d9e5b103b2e003da24affdf331d4f17aee75bbfe64002460",
-		"020500000000000121e2227ffe400d30aa7fffc7a9ff4ca3579a492b41d4a6a76aa6fa5decc70b4c2c321bdc6b0c7af84827e39334533bcc2129d43f3048dbbb5967a0e085025ee45332340fbf3ded39eb70de30f357a9a1b8606fb443188655ab56ad5ab56ad5ab56ae27ad5ab56ad5ab56ad5ab56ad5ab5883d5ab56ad5ab56ad5ab56ad5ab5709756ad5ab56ad5ab56ad5ab56ad5c09d5ab56ad5ab56ad5ab56ad5ab5701b56ad5ab56ad5ab56ad5ab56ad5bfad5ab56ad5ab56ad5ab56ad5ab56f7ad5ab56ad5af2ebf311144b57a4b60830e759209c3e85cfe44de2a40be620c3f88a30bc4c1b2de9349d86027ca75c5ad41b58757efe4139b7692ed39214c6b1f417c2e88abe3b48f2557c22e34a12a11a10b7ea6326abacb730ed45eb3cd8341b6df06cc030c7518bde5bd7f9475b4a0ba0ef6e4607627cd4af208b380cd7d82b9262d4572dd86d727d2de15ff1b43faae0c76836970a3f1f47d20b2a28fa8f5f0d979f0e7bc66e045b56ed1403f9e0cfe823da2a470dbf1d7336edcf3796c24fc0bda1c3c12f2661a311729b5d5a7f363bed852855e4faa8bb8b8b9c8b85fdfafd89859ca110c978002fe46c34d5cc364a2ccc75fd388e0203854eda5a267e7f220d26bdc604cdeea2a4c5da4877bdd9d01ee450cba0435c6c76c65fd98d8a5ddc9e22a27cdeeb43811d6ee28972ee2e1cab9066968f3dcb1959759fdff5dfa4e9f31e24e854e68d23db7e45e3dae6cfd0b6da66125139c949b1c6ed9d312fb778914325d329778dfa91944886ec77cb0df7d932bb361307180e7d06f89c3d729b92cb7c41ee02f0603b7ead0a71b62343e997cc81368699a14ced4a4495f64c42aa153a47ba3e9185cf572e3b388c421ff816dc5c1969f78e092dd5864f3e8e10fb69a152ad11a0c2c9b8c31949fceeb3e0e8c67da9f65d2f91bfdd6f75e5cfa3e30dba6014f5ed560a5551172ab746088aacac1a7c20d57d4e34ac45ea6caa3ab47e700f7b0751760b6e6c85f19667b2ea47ed2ff3a0aef142b8d3eb7b83ac3c45ffde1ad8af0db6f2896758283bbc3fcd5df65fc0a6f5659b3653fade0be81be758d9192324ba9bf69f6f527d182efed845a06a31e68e67e52f211b3167007d4c9b62285e73d518593e0a6ee8c6d3c2525e5200e2815820987aebd2bd31cde1bb9c6c3b1a0bcd072f0394c6a078a222fcb3496281c23dca1a82faeedeae9e81d0aabae7325188d7baa7950aadc7763260c4e977093c7699624a519b079aff2d25dfcc91abb938f34f5b9cd83710f0a84d1322cbd950d37680c6f73916d2ad5ab56ad5ab56ad5a8a1d5ab56ad64fca0386aa0def838dace756ad5ab56ad5ab56ad5ab56ad5a8eed5ab56ad5ab56ad5ab56ad5ab55baab56ad5ab56ad5ab56ad5ab56acf7d5ab56ad5ab56ad5ab56ad5ab568b292a4c8fffffa4d2e3c3c335d679830ad89ec4ecc65d0ee4f086b7f992f4c1d059370f2118ce45b524637e77ebd3974077fbd48be47ee982ee3792959ef92f4d2194fb926960bbc8611c2cb86ebb474b1a386daaa4bf98fd1d9094c2a440dcb6bca069506f5cf61ffdc77621b07ecefb635c8a7f29ec19f5dfad07d20d44173aaa0af7fdd13b1a191ec81ff88ffebbbf9a7bc7e2638a44fb23a697fc74b520a8442c95bacede24d48efdaf22363fbb04f7ac2e534662a653d05081ed96c685e6aab990898e85fb9e2039c45a1da2388835423349fb86f6478778c7dafe6aecf3e97965a20a91a4df099645244f0d38dda4587ffd42ddae9acf55f77af70d6bc0727f80466cb399f281129e10b8780",
-		"c30100000000000121e4215f65fb6312bd39c9ac02260045bbfdc7b6763b03725a7a6ad69b499bd618b54157997e3ccda79967d851d40a93f6a598e0007e1eaa3943b2284f845c18d57780d586e9e39bcd470dd34237c83d0c19c39aba11ab08bc1525cce1829dc0cfcf0fa6c660bb73bb1c97017c155d7b9f908043163b0e2d44be27f708c76c2bfbeb7a66111100add34d481dfad46549b06e00e8cfb0943a43b9daa613f6ed4f6f89c6fe2136e401c334658c160d1f58d4e3f0286bc3dc843e719631201ceb8de10c81a5e4ac3261d84e63d85443f8044ea39652403f7645612740bf32ae73110825358fc1d0be15c591e0d24ae18708bf5e3f49f129edb95cfc55dd828f58ec2de7cd89675f51c103fc4ee410e83d975d0031218193ea6cc93c199d08c806831de793a455170b98e5538808af952212e92197db7eba132e6100414c6867c820cc668321cd15180455c8327fb577201c0b133a4a218948188589b3407f96e3ba933407fb3b33636d44246bc4d34a4457dadc2e91c72d427452259003f9d2f627e1ef1a07619136b0f39a313417affe890a8bf476da5044c0c6d88e6d3cf3bdcca70ff0314dfdcb42af644ff888c4f01454cbb19380c57080426a56d746b2b0",
-		"237200000000000121e620878a1eee3fffc7358a9614985662475c81dddb32c51d98999ffc7e87d07d866bef964b65e978c4a6c8b780cacf5d70ad1b84b085e3b254c4a23ccffdafe28c5d73781e5b884c429524d2774bda2fff8db3fd433d01087a79f407b0e579d64ab379cfc6a52ad567346ce09e4b2a49cc0937407d167a91cbbf31e98ef37c1ba57e2fdb0b5b3ff2114edfab2f20413ff3357edcc2e0090f37b5ca10b1f02d0c3270d47b6ca8dae7e84b15a5b52cb21146ec6d25090dd7aa430ccef7ccbc3dcf2e00de80161ebc54bad2a4b0e948709f85004a3819d1f220e951611369523f8cea1fe23011809c666f39cafb2784560eb19f75c026c7906dcaa78475a636d8742806437dbdb23bb98ac8d28b471c15728d7f410948d97f037dce8db794c6f5063dcd90fd5e8be9a802bc8ec3dd9ee37078a791cc3e1612bf5de11699f0d091baeb138b3963a4d01a78178565aedcf02d719431c628e8680230855c529f79c4e1b133ffa632b678a6eacb40ea7b4c7219b6a648494897ef92255983eca37f2b02c1e70a9cce41d87be00d2bd3fe90d4a1f7a53d3bc893e494da9f8fcee07e30061461b53f90fdbb3d01d629ffd3b0a90e94fb408914535497f629a4076de30976ab4eb18282059b349fd44a3be4ab7755990e1e0e47d06482256c984df926fd9738541b273056ff853c095838f00e83c61ac99936a1eec6935be0748dbfab4d763f0c3cf5e910458d6ca07bd5a91713d8055b25701b63ca672fbe60a9496c13f557d0e09bfa545b98c9ca19e1e120c5fcabcb42f4c7436053abab0cabd9ed45cc29127aed8e51a66125585ab4cd5087c77062e5e36ba4b3f47e110d234526c3a2816f27f90a55a1b9856a24dc1f98b0ad8817fbf3408ba96c68e13e97c9249cb84e80462769267726de6a6c4e14b5073a95b6f16515f06a11f00c4d543f570115d81c98b09ad03295dbf1401da02e67f5821e891164bd9cc7be7af247de506e72c140e6d60ff4bb131ef3a1bbf9e8f33fd321675f8c43d3ed8557814cab723288bb10bb51d99be80b6db6fa2677bf8ed4957de217a4d0481bb7ba8c3933414ca29153713d3e9782dc625b357da7f18bde7fc208cf87a38d6716676a4f48887b2525c769bade1f763e6fb8a08556a1de9cdcc39112e3346b6357552a60674fe6d1177982af3712b25f58bb095580e2be7ce184cc79d5b1ebb1b22f2e56126bfe3395581d2225828f3f3b76f0f224078a233e3b374eb1ad23a638e7e4a45dc8d73b16e657f38234817fcf0d2a93866648461826ec0643d33b9be0b1c9071ce4d7e3ef2d84edec15cffdbf3fdec769eff0c56827f9b92d549e815d39ce094b260c902df65dbc4d130d90f1ee847dea88be59a5cd33c28405081c5ce2c2a3f21e3b7cbb4bdfdc8ed6a2c4944f04887c373dbcf162bc4e59c6bc84cbb3c436ca14b27a5a71805ec0b16a1826aed8e3844bcdb61c3d06ef5bb9d06182d4cf41cb680873f46ca0edd32404af85965ec75fcef258471aeb869e998017e425eee671a49339df35e5e9f00989d4831dccaa7f14a5c39a0fbea0106846d6af639dbad4e312dffc4c2a725ee87befec1b4ca557680bd696673d429b78d3554e5bbb02d59e033e268c31b3fc5428e6bf043207e346bbe8748ffc384fdb7fb6d418d990c76ee09299936189226c67f374b89fc471695d5034d9ef050b6778e300f7eadf5b78a025b1c93f6a1216b6017c7864761410fd1ce3768daa830b5dbd253a0407f29d25c70bc8aad87029b049413113bd98a2c67dc5ce2fd1fe505ae19e3dfdbc9b3e701ebd0dac9c41f68320c7e07860279c56a00cad608b157846605b00b7954eb56b13e5f73201e30bb36806afe45922c5cc8af20b8ba1dab1fde42189d78cdc7ad49b0c0ca230154b7d69dd7fd7ab169f11e9d3de126d86f28e04739999371423d9ce032c5e23e13242b5d8f24c7650ad70da37736211367b6bf04880fbd518d5d02ebb6845d4ebab7a3bc0a5f6b9d3be3f178380169292ae0da51a71604465ebd12b0e8969",
-		"bea5f53fe85a29ff1a8a880efd9b24e3ca74b546a43355c2b0dead283caef3cffbbf66608221235e59a6e4b4a55fd2b5419970be4f09dea9be22febb09b1d31b1efaacdc2aa272a750d45dbb6a2b7b8b7d85d86a011ffbc5cc865f75e535d084297b0f501d159a424e99014022475ae2fafa03ef911431798e11ba133c4e0565792e84cbafdfa2abfef01f734f85e8fb6ba25aa791122e54d8d31f21903c4510aaee35b0ed21dcc9e37670eb40de12dcba4c31fcd208575568c462f01f1a2a071ba1398ef948fe3fe014ff72e1df91a6db859cf5e8795a946251dcb7f3fbaafa172c058ba2df98000a743bd2e38fc7a535ae9470cb3937c4991ba2058fb63f60b717df963ef92054c7b0f1db00c7b975da415f722f461bd1761f9c693152baad4fcf4b77eabfba1f58e13e4d22c31f66e06a59a8a58627a646cfd6893caaf9fd89694c4943c9ea0d3d825290fe5fbf199c3055220cd61bffeee94edcc116102f74a1c5466dbe66f1489a0544484df398d4f54443178856672e2dba052dae726fe352862706a512a997a86c2ccc81cd3ada5b888a126eb27f82b305389c77e9463d1f2c39db5a6e72ab6f07e79759a1b228a5571985a823b399d00fb5e44b5f65a7c2caffee305a54ab88c05bb75e5d291e02cdd6ae85b3eeb7dac1b72fc7decc5aff260eb882ee6bbeb76e26b1f668ec1eebd8a95817f21f2b1ba90e313e6d1b14fa2a055990ed69116d1760bb388c441c47b6fa68a7e35772756eaf3edc75c8b59e4af35f331379b6fe7f02e54fe14db7d6cd84380a4872f8ba40d3c3cb35b6e69d2cf62533a0f976c2765f6cd339f19d94e42277a6f726f6eb83880fa5bb9b9bc93782e298cc14f0952b687f473c2a40b060098113c243b483dc64a09cd89bbd290655239c4230ae68abd64e45e88614af2758ff24ac5d4c2de8fdf2b18b84372092ce57ed637cfe9d8c08fbf7b439a63eafee18b2547bed39cdc74d16d212d4d0501329fbb6030289133f169e61b8fd9da5e5ab4d0d741c3d62f5d6262d31e9fd43ee64367f99e6044b407cac9a36d5143c8e6b569fd4d336b1dd09e88bb178d3f85a4b554fdce969371f1533bd4a35bc109d542a37950873849900ca3b4c621f1c8eca7716ca608601a02eaf6392d9b5870fac1605b937dd2ded0e73a13fd1eb16794f801f1684f17621f8316d5d2dc6e99d462ed90befb5dc7a2553ce8532f872208262d47b1dba8f4afe6cfad7519b5ba45251ab5590f3f5435c925ff2d97ad6e7f0e56de24812feae6aadbaf50268f3e92042d3a4e7ee0af546c1e282ed97c17fa8d856abd45d951e638a5708f05c256b553e57c7510be202683552a9d7cc8a33123304bb52d72c6a00d1f3ab1f3b3c86abee583799758442746f043efdab0913ee7639c502d8b22d910c036fee3bc5ac127d9968b20d88990f40801e080dbc32b19f8386eeed7332ef29f429337f731cdba9d4359bf32a46a3e2d9e7437f154229ddf6098bea243a561686020014c70c980e915ad002413e1f236241cf397c48d3c9e58ac0923d568966c5ac39b735c2d941f0507b9bed3d5cd48edb7f05b828076034651d3a4192b1f3ec6f7b606cbd98d46aca32e33893b96129582cfd45cf2f32960211dd8414e4d6606986e8e3e20ebc60ccdd8349a3d914a37f04a12b362cfb06a5854a16b67dc9b68af68ab65f691b75651d29f84c55ceaeb3300f6c37de5d0071d77925748e4c4edb6e08ae460e6ed4c26db1d3f0c86707defcedb47cfed4ea6ff0c005916e5f5e0ece0e29e5443ef909d8bf2160a91bbf3d4615d49400eaddfbb85fda927e420fece8850f833c28de6e714c9e9e7eb2c451401e60a86c685134e738ad0bd8ad71d410fcf5ed36b4af9ca07d52def0b8366e905ae3c7b8ecdcd9109b3a92dffeb61a441f852341584758f607dc975f5683fb16d5831ece86e8c75d4c5cc4b66ca051abcd06721b5121b8c3809346ce42e9cb2ef92e4d94f90c09e9068c6f232d7b4dc829550a142c4347d6baa3d6db55b285a3ee4847572c2a5f",
+	st := &connectionState{
+		frameCounter: 0,
+		pollCount:    0,
 	}
-	idx := 0
 
 	for {
-		// Read exactly 8 bytes (like the while(read < 8) {...} loop)
-		if _, err := io.ReadFull(input, hdr); err != nil {
+		// Read 8 bytes (poll header)
+		if _, err := io.ReadFull(input, header); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				// remote closed or incomplete header: just stop
+				log.Printf("MediaStream: Error reading header: %v", err)
 				return
 			}
-			log.Printf("error reading header: %v", err)
+			log.Printf("MediaStream: Unknown error reading header: %v", err)
 			return
 		}
 
-		// Little-endian uint16 command (equivalent to: short.toInt() & 0xFFFF)
-		cmd := binary.LittleEndian.Uint16(hdr[0:2])
+		cmd := binary.LittleEndian.Uint16(header[0:2])
 
 		if cmd != 0x0072 {
-			log.Printf("MDTA DISCARDED: %s", hex.EncodeToString(hdr))
-
-			// output.write(ZERO4); output.flush()
+			// Not a poll pacing command, discard and send idle 0's
+			log.Printf("MediaStream: non-0x0072 cmd %04x, sending idle", cmd)
 			if _, err := output.Write(zero4); err != nil {
-				log.Printf("error writing ZERO4: %v", err)
+				log.Printf("MediaStream: error writing idle: %v", err)
 				return
 			}
 			if err := output.Flush(); err != nil {
-				log.Printf("error flushing ZERO4: %v", err)
+				log.Printf("MediaStream: error flushing idle: %v", err)
 				return
 			}
 			continue
 		}
-		log.Printf("MDTA IN: %s", hex.EncodeToString(hdr))
-		payload := stock[idx]
-		if b, err := hex.DecodeString(payload); err != nil {
-			log.Printf("error decoding payload: %v", err)
-			continue
-		} else {
-			if _, err = output.Write(b); err != nil {
-				log.Printf("error writing payload: %v", err)
-				continue
+
+		st.pollCount++
+
+		body, err := s.src.NextFrame(time.Now())
+		if err != nil {
+			log.Printf("MediaStream: error reading frame: %v", err)
+			// we will send an idle 0s body so the connection stays open
+			if _, err = output.Write(zero4); err != nil {
+				log.Printf("MediaStream: error writing idle after src failure: %v", err)
+				return
 			}
 			if err = output.Flush(); err != nil {
-				log.Printf("flush error: %s", err)
-				continue
+				log.Printf("MediaStream: error flushing idle after src failure: %v", err)
+				return
 			}
-			log.Printf("Media Stream idx: %d", idx)
-			idx++
-			if idx >= len(stock) {
-				idx = 0
+			continue
+		}
+
+		// If no payload is available, send idle 0s
+		if body == nil || len(body) == 0 {
+			if _, err = output.Write(zero4); err != nil {
+				log.Printf("MediaStream: error writing idle: %v", err)
+				return
 			}
+			if err = output.Flush(); err != nil {
+				log.Printf("MediaStream: flush error (idle): %v", err)
+				return
+			}
+			continue
+		}
+
+		// Legacy pacing - 4B len + 4B idx + body
+		frame, idx := buildFramedPacket(body, st.frameCounter)
+		st.frameCounter = (st.frameCounter + 1) & 0x7FFFFFFF
+
+		// Send it chunked, send it paced
+		if err = sendChunked(output, frame, s.chunkSize, s.chunkSleep); err != nil {
+			log.Printf("MediaStream: error sending chunks (idx=%d): %v", idx, err)
+			return
 		}
 	}
 }
