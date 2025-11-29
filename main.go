@@ -15,6 +15,10 @@ import (
 	"github.com/google/uuid"
 )
 
+const targetFPS = 30
+
+var muxSource *MuxSource
+
 type Host struct {
 	Ip      string
 	Port    string
@@ -80,14 +84,24 @@ func SearchForService(ctx context.Context) *Host {
 	}
 }
 
-func main() {
-	// Load no signal stream service
-	noSigSrc, err := NewNoSignalSource("./static.h264", 15)
+func SetupSources() error {
+	noSigSrc, err := NewNoSignalSource("./iris_out.h264", targetFPS)
 	if err != nil {
-		log.Fatalf("Failed to create no signal source: %v", err)
-	} else {
-		log.Println("Signal source created")
+		return err
 	}
+	liveSrc := NewLiveStreamSource(targetFPS, 3*time.Second, 3)
+	muxSource = &MuxSource{NoSignal: noSigSrc, Live: liveSrc}
+	return nil
+}
+
+func main() {
+
+	// Setup sources
+	if err := SetupSources(); err != nil {
+		log.Fatalf("Failed to setup sources: %s", err)
+		return
+	}
+	desktopStreamer := NewDesktopStreamer(muxSource.Live.(*LiveStreamSource))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	host := SearchForService(ctx)
@@ -97,9 +111,8 @@ func main() {
 		log.Println("Starting EC service...")
 		ecService := NewECService(host.Ip, host.Port, host.Package, "Android")
 		if err := ecService.Start(); err != nil {
-			log.Fatal(err)
+			log.Fatalf("Error running EC service: %v", err)
 		}
-		log.Println("EC service started")
 
 		// Startup stage channels
 		pxcReady := make(chan any, 1)
@@ -109,7 +122,7 @@ func main() {
 		var keyPair *KeyPair
 		phoneUUID := uuid.New()
 		if kp, err := GenKeyPair(); err != nil {
-			log.Fatal(err)
+			log.Fatalf("Failed to generate key pair: %v", err)
 			return
 		} else {
 			keyPair = kp
@@ -186,7 +199,7 @@ func main() {
 		}()
 
 		// Create Media Stream Server - This service is the one that sends H264 stream data
-		mediaStream := NewMediaStream(":10920", noSigSrc, 0x1000, 3*time.Millisecond)
+		mediaStream := NewMediaStream(":10920", muxSource, 0x1000, 3*time.Millisecond)
 
 		defer func(s *MediaStream, ctx context.Context) {
 			err := mediaStream.Stop(ctx)
@@ -220,6 +233,12 @@ func main() {
 		if err := mediaControl.Start(); err != nil {
 			log.Fatalf("Error starting media control: %s", err)
 		}
+
+		// Start Desktop live stream
+		log.Println("Start Desktop Live Stream ------")
+		if err := desktopStreamer.Start(); err != nil {
+			log.Fatalf("Error starting desktop stream: %s", err)
+		}
 	}
 
 	// Create channel to receive OS signals
@@ -232,5 +251,6 @@ func main() {
 	<-sigs
 
 	fmt.Println("Shutting down gracefully")
+	_ = desktopStreamer.Stop()
 	cancel()
 }

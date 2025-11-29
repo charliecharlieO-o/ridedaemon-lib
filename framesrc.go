@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -177,5 +178,266 @@ func (s *NoSignalSource) NextFrame(now time.Time) ([]byte, error) {
 
 	// Idle poll - keep cadence, no new frame
 	s.pollCount++
+	return nil, nil
+}
+
+type LiveStreamSource struct {
+	mu sync.Mutex
+
+	// Ring buffer for queued AUs for efficiency purposes
+	aus      [][]byte
+	head     int
+	tail     int
+	count    int
+	capacity int
+
+	lastAU      []byte // Freeze frame
+	lastAdvance time.Time
+	interval    time.Duration // 1/fps
+
+	active      bool
+	lastInput   time.Time
+	liveTimeout time.Duration
+}
+
+func NewLiveStreamSource(targetFPS int, liveTimeout time.Duration, maxQ int) *LiveStreamSource {
+	if targetFPS <= 0 {
+		targetFPS = 15
+	}
+	if liveTimeout <= 0 {
+		liveTimeout = 3 * time.Second
+	}
+	if maxQ <= 0 {
+		maxQ = 15
+	}
+	return &LiveStreamSource{
+		aus:         make([][]byte, maxQ),
+		capacity:    maxQ,
+		lastAU:      nil,
+		lastAdvance: time.Time{},
+		interval:    time.Second / time.Duration(targetFPS),
+		active:      false,
+		lastInput:   time.Time{},
+		liveTimeout: liveTimeout,
+	}
+}
+
+// PushFrame is called by a live encoder, expected H.264 AU in Annex B aud + sps/pps + idr
+func (s *LiveStreamSource) PushFrame(au []byte) bool {
+	if len(au) == 0 {
+		return true
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	s.active = true
+	s.lastInput = now
+
+	if s.count == s.capacity {
+		// Drop the oldest frame
+		s.aus[s.head] = nil
+		s.head = (s.head + 1) % s.capacity
+		s.count--
+	}
+
+	buf := append([]byte(nil), au...) // copy buffer so memory can be reused
+
+	s.aus[s.tail] = buf
+	s.tail = (s.tail + 1) % s.capacity
+	s.count++
+
+	return true
+}
+
+func (s *LiveStreamSource) IsActive(now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.active {
+		return false
+	}
+
+	if !s.lastInput.IsZero() && now.Sub(s.lastInput) > s.liveTimeout {
+		s.resetLocked()
+		return false
+	}
+	return true
+}
+
+func (s *LiveStreamSource) resetLocked() {
+	s.active = false
+	s.lastAU = nil
+	s.lastAdvance = time.Time{}
+	s.count = 0
+	s.head = 0
+	s.tail = 0
+}
+
+// NextFrame fits our FrameSource interface's NextFrame signature.
+func (s *LiveStreamSource) NextFrame(now time.Time) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Active checks
+	if !s.active {
+		return nil, nil
+	}
+	if !s.lastInput.IsZero() && now.Sub(s.lastInput) > s.liveTimeout {
+		s.resetLocked()
+		return nil, nil
+	}
+
+	// Advance to a new AU based on target FPS
+	shouldAdvAU := false
+	if s.lastAU == nil {
+		shouldAdvAU = true
+	} else if s.lastAdvance.IsZero() || now.Sub(s.lastAdvance) >= s.interval {
+		shouldAdvAU = true
+	}
+
+	if shouldAdvAU {
+		// Pop the next live AU
+		if s.count > 0 {
+			au := s.aus[s.head]
+			s.aus[s.head] = nil // give the garbage collector a hand ;)
+			s.head = (s.head + 1) % s.capacity
+			s.count--
+
+			s.lastAU = au
+			s.lastAdvance = now
+			return au, nil
+		}
+
+		// No queued frames? we can repeat lastAU or return nil
+		if s.lastAU != nil {
+			s.lastAdvance = now
+			return s.lastAU, nil
+		}
+		return nil, nil
+	}
+
+	return nil, nil // idle but we keep cadence
+}
+
+// extractAusFromStream scans `buf` for AUD-delimited AUs in Annex B format
+// and returns (completeAUs, remainingBytes).
+//
+// It assumes NALs are prefixed by 0x000001 or 0x00000001, and treats
+// each AUD (nal_unit_type == 9) as the start of an AU.
+// Everything from one AUD start to the next AUD start is an AU.
+func extractAusFromStream(buf []byte) ([][]byte, []byte) {
+	const nalAud = 9
+
+	var audStarts []int
+
+	// Find all start codes followed by AUD NAL
+	i := 0
+	for i+3 < len(buf) {
+		// 3-byte start code: 0x000001
+		if buf[i] == 0 && buf[i+1] == 0 && buf[i+2] == 1 {
+			nalHeaderIdx := i + 3
+			if nalHeaderIdx < len(buf) {
+				nalType := buf[nalHeaderIdx] & 0x1F
+				if nalType == nalAud {
+					audStarts = append(audStarts, i)
+				}
+			}
+			i += 3
+			continue
+		}
+
+		// 4-byte start code: 0x00000001
+		if i+4 < len(buf) &&
+			buf[i] == 0 && buf[i+1] == 0 && buf[i+2] == 0 && buf[i+3] == 1 {
+			nalHeaderIdx := i + 4 // first byte after start code
+			if nalHeaderIdx < len(buf) {
+				nalType := buf[nalHeaderIdx] & 0x1F
+				if nalType == nalAud {
+					audStarts = append(audStarts, i)
+				}
+			}
+			i += 4
+			continue
+		}
+
+		i++
+	}
+
+	// No AUD at all: nothing we can form into AUs yet.
+	if len(audStarts) == 0 {
+		return nil, buf
+	}
+
+	// Only one AUD: treat everything from that AUD onward as "maybe incomplete".
+	if len(audStarts) == 1 {
+		return nil, buf[audStarts[0]:]
+	}
+
+	// Build complete AUs between successive AUDs: [AUD_i, AUD_{i+1})
+	aus := make([][]byte, 0, len(audStarts)-1)
+	for j := 0; j < len(audStarts)-1; j++ {
+		start := audStarts[j]
+		end := audStarts[j+1]
+		if start < end && end <= len(buf) {
+			// Copy out so caller can safely reuse original buffer.
+			auCopy := append([]byte(nil), buf[start:end]...)
+			aus = append(aus, auCopy)
+		}
+	}
+
+	// Remaining data from last AUD to end (possibly incomplete AU).
+	remaining := append([]byte(nil), buf[audStarts[len(audStarts)-1]:]...)
+
+	return aus, remaining
+}
+
+// feedStreamToLiveSource reads io buffer data and feeds it to the LiveStreamSource in chunks
+func feedStreamToLiveSource(r io.Reader, src *LiveStreamSource) error {
+	const chunkSize = 4096
+	buf := make([]byte, chunkSize)
+	var leftover []byte
+
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			chunk := append(leftover, buf[:n]...)
+			aus, rem := extractAusFromStream(chunk)
+			leftover = rem
+
+			for _, au := range aus {
+				_ = src.PushFrame(au)
+			}
+		}
+
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+type MuxSource struct {
+	Live     LiveSource
+	NoSignal FrameSource
+}
+
+func (m *MuxSource) NextFrame(now time.Time) ([]byte, error) {
+	// Prefer live if it's active
+	if m.Live != nil && m.Live.IsActive(now) {
+		au, err := m.Live.NextFrame(now)
+		if err != nil {
+			return nil, err
+		}
+		return au, nil
+	}
+
+	// No live available switch to static
+	if m.NoSignal != nil {
+		return m.NoSignal.NextFrame(now)
+	}
 	return nil, nil
 }

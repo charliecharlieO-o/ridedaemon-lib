@@ -16,6 +16,11 @@ type FrameSource interface {
 	NextFrame(now time.Time) ([]byte, error)
 }
 
+type LiveSource interface {
+	FrameSource
+	IsActive(now time.Time) bool
+}
+
 type connectionState struct {
 	frameCounter uint32
 	pollCount    uint64
@@ -82,7 +87,6 @@ type MediaStream struct {
 	quit     chan any
 	wg       sync.WaitGroup
 	listener net.Listener
-	Errors   chan error
 
 	// Shared frame source (temp)
 	src FrameSource
@@ -90,6 +94,9 @@ type MediaStream struct {
 	// Config
 	chunkSize  int           // e.g 0x1000
 	chunkSleep time.Duration // e.g 3 * time.Millisecond
+
+	// Interface events
+	Errors chan error
 }
 
 func NewMediaStream(port string, src FrameSource, chunkSize int, chunkSleep time.Duration) *MediaStream {
