@@ -65,8 +65,10 @@ type CfmotoHUD struct {
 	muxSource *stream.MuxSource
 
 	// Communications
-	Events chan HudEvent
-	Errors chan error
+	stopped  chan any
+	stopOnce sync.Once
+	Events   chan HudEvent
+	Errors   chan error
 }
 
 func NewCfmotoHUD(targetFPS int, mux *stream.MuxSource) *CfmotoHUD {
@@ -96,6 +98,7 @@ func NewCfmotoHUD(targetFPS int, mux *stream.MuxSource) *CfmotoHUD {
 		},
 		targetFPS: targetFPS,
 		muxSource: mux,
+		stopped:   make(chan any),
 		Events:    make(chan HudEvent, 32),
 		Errors:    make(chan error, 32),
 	}
@@ -418,6 +421,10 @@ func (hud *CfmotoHUD) StopStream(ctx context.Context) error {
 	close(hud.Events)
 	close(hud.Errors)
 
+	hud.stopOnce.Do(func() {
+		close(hud.stopped)
+	})
+
 	return nil
 }
 
@@ -425,4 +432,8 @@ func (hud *CfmotoHUD) IsRunning() bool {
 	hud.mu.Lock()
 	defer hud.mu.Unlock()
 	return hud.running
+}
+
+func (hud *CfmotoHUD) Done() <-chan any {
+	return hud.stopped
 }

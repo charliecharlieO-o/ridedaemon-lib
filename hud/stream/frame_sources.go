@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -191,6 +192,34 @@ func (s *FileFrameSource) NextFrame(now time.Time) ([]byte, error) {
 	return nil, nil
 }
 
+type RawFrameSource struct {
+	FileFrameSource
+}
+
+func NewRawFrameSource(src []byte, targetFPS int) (*RawFrameSource, error) {
+	aus := splitByAudAnnexB(src)
+	if len(aus) == 0 {
+		return nil, errors.New("no AUD-delimited AUs found in source")
+	}
+
+	if targetFPS <= 0 {
+		targetFPS = 15
+	}
+
+	interval := time.Second / time.Duration(targetFPS)
+	return &RawFrameSource{
+		FileFrameSource: FileFrameSource{
+			aus:          aus,
+			replayIdx:    0,
+			pollCount:    0,
+			lastAu:       nil,
+			lastAdvance:  time.Time{},
+			interval:     interval,
+			streamHeader: append([]byte(nil), streamHeader...),
+		},
+	}, nil
+}
+
 type LiveStreamSource struct {
 	mu sync.Mutex
 
@@ -233,9 +262,9 @@ func NewLiveStreamSource(targetFPS int, liveTimeout time.Duration, maxQ int) *Li
 }
 
 // PushFrame is called by a live encoder, expected H.264 AU in Annex B aud + sps/pps + idr
-func (s *LiveStreamSource) PushFrame(au []byte) bool {
+func (s *LiveStreamSource) PushFrame(au []byte) {
 	if len(au) == 0 {
-		return true
+		return
 	}
 
 	s.mu.Lock()
@@ -257,8 +286,6 @@ func (s *LiveStreamSource) PushFrame(au []byte) bool {
 	s.aus[s.tail] = buf
 	s.tail = (s.tail + 1) % s.capacity
 	s.count++
-
-	return true
 }
 
 func (s *LiveStreamSource) IsActive(now time.Time) bool {
@@ -417,7 +444,7 @@ func feedStreamToLiveSource(r io.Reader, src *LiveStreamSource) error {
 			leftover = rem
 
 			for _, au := range aus {
-				_ = src.PushFrame(au)
+				src.PushFrame(au)
 			}
 		}
 
@@ -440,7 +467,7 @@ func (m *MuxSource) NextFrame(now time.Time) ([]byte, error) {
 	if m.stopAll.Load() {
 		return nil, nil
 	}
-	
+
 	// Prefer live if it's active
 	if m.Live != nil && m.Live.IsActive(now) {
 		au, err := m.Live.NextFrame(now)

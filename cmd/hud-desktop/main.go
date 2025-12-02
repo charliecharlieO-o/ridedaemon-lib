@@ -46,7 +46,7 @@ func main() {
 	}()
 	go func() {
 		for evt := range cfmotoHUD.Events {
-			log.Printf("Event: %s\n", evt)
+			log.Printf("Event: %v\n", evt)
 		}
 	}()
 
