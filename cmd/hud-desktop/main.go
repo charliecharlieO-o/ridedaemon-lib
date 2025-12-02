@@ -18,7 +18,7 @@ const targetFPS = 30
 var muxSource *stream.MuxSource
 
 func SetupSources() error {
-	noSigSrc, err := stream.NewFileFrameSource("./iris_out.h264", targetFPS)
+	noSigSrc, err := stream.NewFileFrameSource("./static/iris_out.h264", targetFPS)
 	if err != nil {
 		return err
 	}
