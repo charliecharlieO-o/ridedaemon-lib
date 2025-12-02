@@ -1,4 +1,4 @@
-package main
+package stream
 
 import (
 	"os"
@@ -12,7 +12,6 @@ type DesktopStreamer struct {
 }
 
 func NewDesktopStreamer(src *LiveStreamSource) *DesktopStreamer {
-	// Put your exact ffmpeg args here
 	args := []string{
 		"-f", "avfoundation",
 		"-pixel_format", "uyvy422",

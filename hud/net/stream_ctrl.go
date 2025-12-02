@@ -1,4 +1,4 @@
-package main
+package net
 
 import (
 	"bufio"
@@ -9,9 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"sync"
+
+	"github.com/charliecharlieO-o/ridedaemon-go/internal/logging"
 )
 
 const mediaCtrlHeaderSize = 8
@@ -55,6 +56,8 @@ type MediaControl struct {
 	wg       sync.WaitGroup
 	listener net.Listener
 
+	stopOnce sync.Once
+
 	Errors chan error
 	Events chan MediaCtrlResponse
 }
@@ -63,8 +66,24 @@ func NewMediaControl(port string) *MediaControl {
 	return &MediaControl{
 		port:   port,
 		quit:   make(chan any),
-		Errors: make(chan error),
-		Events: make(chan MediaCtrlResponse),
+		Errors: make(chan error, 16),
+		Events: make(chan MediaCtrlResponse, 16),
+	}
+}
+
+func (s *MediaControl) emitEvent(evt MediaCtrlResponse) {
+	select {
+	case s.Events <- evt:
+	default:
+		// channel full, drop
+	}
+}
+
+func (s *MediaControl) emitError(err error) {
+	select {
+	case s.Errors <- err:
+	default:
+		logging.Printf("Dropping error from MediaControl [No one's listening!]: %v", err)
 	}
 }
 
@@ -89,12 +108,12 @@ func (s *MediaControl) acceptLoop() {
 			case <-s.quit:
 				return // Normal shut down
 			default:
-				log.Printf("Error accepting connection: %s", err)
+				logging.Printf("Error accepting connection: %s", err)
 				continue
 			}
 		}
 
-		log.Printf("New MediaControl client from %s", conn.RemoteAddr())
+		logging.Printf("New MediaControl client from %s", conn.RemoteAddr())
 		s.wg.Add(1)
 		go s.handleConn(conn)
 	}
@@ -124,54 +143,54 @@ func (s *MediaControl) writeResponse(res *MediaCtrlResponse, conn net.Conn) erro
 func (s *MediaControl) handleEvent(event *MediaCtrlResponse, conn net.Conn) {
 	switch event.Command {
 	case MediaCtrlInit:
-		s.Events <- *event
+		s.emitEvent(*event)
 		hexPayload := "020000002003800101"
 		bytes, err := hex.DecodeString(hexPayload)
 		if err != nil {
-			s.Errors <- err
+			s.emitError(&CtrlError{CtrlDecodeErr, err, true})
 			break
 		}
 		response := &MediaCtrlResponse{Command: MediaCtrlAck, Size: uint16(len(bytes)), Payload: bytes}
 		if err = s.writeResponse(response, conn); err != nil {
-			s.Errors <- err
+			s.emitError(&CtrlError{CtrlWriteErr, err, true})
 			break
 		}
 	case MediaCtrlScreenConf:
-		s.Events <- *event
+		s.emitEvent(*event)
 		viewState := View{
 			ViewAreaConfig:  ViewConfig{State: 0},
 			SupportFunction: 0,
 		}
 		var payload []byte
 		if p, err := json.Marshal(viewState); err != nil {
-			s.Errors <- err
+			s.emitError(&CtrlError{CtrlDecodeErr, err, true})
 			break
 		} else {
 			payload = p
 		}
 		response := &MediaCtrlResponse{Command: MediaCtrlViewState, Size: uint16(len(payload)), Payload: payload}
 		if err := s.writeResponse(response, conn); err != nil {
-			s.Errors <- err
+			s.emitError(&CtrlError{CtrlWriteErr, err, true})
 			break
 		}
 	case MediaCtrlChk:
 		response := &MediaCtrlResponse{Command: MediaCtrlRcv, Size: 0}
 		if err := s.writeResponse(response, conn); err != nil {
-			s.Errors <- err
+			s.emitError(&CtrlError{CtrlWriteErr, err, true})
 			break
 		}
 	case MediaCtrlPing:
 		response := &MediaCtrlResponse{Command: MediaCtrlPong, Size: 0}
 		if err := s.writeResponse(response, conn); err != nil {
-			s.Errors <- err
+			s.emitError(&CtrlError{CtrlWriteErr, err, true})
 			break
 		}
 	default:
-		s.Events <- *event
+		s.emitEvent(*event)
 		// Try to send a default command + 1 empty response
 		response := &MediaCtrlResponse{Command: event.Command + 1, Size: 0}
 		if err := s.writeResponse(response, conn); err != nil {
-			s.Errors <- err
+			s.emitError(&CtrlError{CtrlWriteErr, err, true})
 			break
 		}
 	}
@@ -182,7 +201,7 @@ func (s *MediaControl) handleConn(conn net.Conn) {
 	defer s.wg.Done()
 	defer func(conn net.Conn) {
 		if err := conn.Close(); err != nil {
-			log.Printf("Error closing connection: %v", err)
+			logging.Printf("Error closing connection: %v", err)
 		}
 	}(conn)
 
@@ -194,11 +213,21 @@ func (s *MediaControl) handleConn(conn net.Conn) {
 		// Read 8 byte header
 		headerBytes := make([]byte, mediaCtrlHeaderSize)
 		if n, err := io.ReadFull(reader, headerBytes); err != nil {
-			s.Errors <- fmt.Errorf("error reading header: %v (read %d bytes: %x)", err, n, headerBytes[:n])
+			s.emitError(
+				&CtrlError{
+					CtrlDecodeErr,
+					fmt.Errorf("error reading header: %v (read %d bytes: %x)", err, n, headerBytes[:n]),
+					true,
+				})
 			return
 		}
 		if req, err := s.decodeHeader(headerBytes); err != nil {
-			s.Errors <- fmt.Errorf("error decoding header: %v", err)
+			s.emitError(
+				&CtrlError{
+					CtrlDecodeErr,
+					fmt.Errorf("error decoding header: %v", err),
+					true,
+				})
 			return
 		} else {
 			request = req
@@ -209,7 +238,12 @@ func (s *MediaControl) handleConn(conn net.Conn) {
 		if request.Size > 0 {
 			payload = make([]byte, request.Size)
 			if _, err := io.ReadFull(reader, payload); err != nil {
-				s.Errors <- fmt.Errorf("[MediaControl] read payload failed from %s: %v", conn.RemoteAddr(), err)
+				s.emitError(
+					&CtrlError{
+						CtrlDecodeErr,
+						fmt.Errorf("[MediaControl] read payload failed from %s: %v", conn.RemoteAddr(), err),
+						true,
+					})
 				return
 			}
 			request.Payload = payload
@@ -235,14 +269,15 @@ func (s *MediaControl) Start() error {
 
 func (s *MediaControl) Stop(ctx context.Context) error {
 	// Signal connection accept loop to stop
-	close(s.quit)
-
-	// Close listener
-	if s.listener != nil {
-		if err := s.listener.Close(); err != nil {
-			log.Printf("[TCPService] error closing listener: %v", err)
+	s.stopOnce.Do(func() {
+		close(s.quit)
+		// Close listener
+		if s.listener != nil {
+			if err := s.listener.Close(); err != nil {
+				logging.Printf("[TCPService] error closing listener: %v", err)
+			}
 		}
-	}
+	})
 
 	// Wait for go routines to vacate
 	done := make(chan any)

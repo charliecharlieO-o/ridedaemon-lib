@@ -1,25 +1,19 @@
-package main
+package net
 
 import (
 	"bufio"
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
-	"log"
 	"net"
 	"sync"
 	"time"
+
+	"github.com/charliecharlieO-o/ridedaemon-go/hud/stream"
+	"github.com/charliecharlieO-o/ridedaemon-go/internal/logging"
 )
-
-type FrameSource interface {
-	NextFrame(now time.Time) ([]byte, error)
-}
-
-type LiveSource interface {
-	FrameSource
-	IsActive(now time.Time) bool
-}
 
 type connectionState struct {
 	frameCounter uint32
@@ -88,8 +82,10 @@ type MediaStream struct {
 	wg       sync.WaitGroup
 	listener net.Listener
 
+	stopOnce sync.Once
+
 	// Shared frame source (temp)
-	src FrameSource
+	src stream.FrameSource
 
 	// Config
 	chunkSize  int           // e.g 0x1000
@@ -99,14 +95,22 @@ type MediaStream struct {
 	Errors chan error
 }
 
-func NewMediaStream(port string, src FrameSource, chunkSize int, chunkSleep time.Duration) *MediaStream {
+func NewMediaStream(port string, src stream.FrameSource, chunkSize int, chunkSleep time.Duration) *MediaStream {
 	return &MediaStream{
 		port:       port,
 		quit:       make(chan any),
-		Errors:     make(chan error),
+		Errors:     make(chan error, 16),
 		src:        src,
 		chunkSize:  chunkSize,
 		chunkSleep: chunkSleep,
+	}
+}
+
+func (s *MediaStream) emitError(err error) {
+	select {
+	case s.Errors <- err:
+	default:
+		logging.Printf("Dropping error from MediaStream [No one's listening!]: %v", err)
 	}
 }
 
@@ -120,12 +124,12 @@ func (s *MediaStream) acceptLoop() {
 			case <-s.quit:
 				return // Normal shut down
 			default:
-				log.Printf("Error accepting connection: %s", err)
+				logging.Printf("Error accepting connection: %s", err)
 				continue
 			}
 		}
 
-		log.Printf("New MediaStream client from %s", conn.RemoteAddr())
+		logging.Printf("New MediaStream client from %s", conn.RemoteAddr())
 		s.wg.Add(1)
 		go s.handleConn(conn)
 	}
@@ -136,7 +140,7 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 	defer s.wg.Done()
 	defer func(conn net.Conn) {
 		if err := conn.Close(); err != nil {
-			log.Printf("MediaStream: Error closing connection: %v", err)
+			logging.Printf("MediaStream: Error closing connection: %v", err)
 		}
 	}(conn)
 
@@ -150,7 +154,7 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 	output := bufio.NewWriterSize(conn, 64*1024)
 	defer func() {
 		if err := output.Flush(); err != nil {
-			log.Printf("MediaStream: Error flushing output: %v", err)
+			logging.Printf("MediaStream: Error flushing output: %v", err)
 		}
 	}()
 
@@ -166,10 +170,18 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 		// Read 8 bytes (poll header)
 		if _, err := io.ReadFull(input, header); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				log.Printf("MediaStream: Error reading header: %v", err)
+				s.emitError(&StrmError{
+					StrmDecodeErr,
+					fmt.Errorf("error reading header: %v", err),
+					true,
+				})
 				return
 			}
-			log.Printf("MediaStream: Unknown error reading header: %v", err)
+			s.emitError(&StrmError{
+				StrmDecodeErr,
+				fmt.Errorf("unknown error reading header: %v", err),
+				true,
+			})
 			return
 		}
 
@@ -177,13 +189,25 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 
 		if cmd != 0x0072 {
 			// Not a poll pacing command, discard and send idle 0's
-			log.Printf("MediaStream: non-0x0072 cmd %04x, sending idle", cmd)
+			s.emitError(&StrmError{
+				StrmUnknownCommandErr,
+				fmt.Errorf("non-0x0072 cmd %04x, sending idle", cmd),
+				false,
+			})
 			if _, err := output.Write(zero4); err != nil {
-				log.Printf("MediaStream: error writing idle: %v", err)
+				s.emitError(&StrmError{
+					StrmWriteErr,
+					fmt.Errorf("error writing idle: %v", err),
+					true,
+				})
 				return
 			}
 			if err := output.Flush(); err != nil {
-				log.Printf("MediaStream: error flushing idle: %v", err)
+				s.emitError(&StrmError{
+					StrmWriteErr,
+					fmt.Errorf("error flushing idle: %v", err),
+					true,
+				})
 				return
 			}
 			continue
@@ -193,14 +217,22 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 
 		body, err := s.src.NextFrame(time.Now())
 		if err != nil {
-			log.Printf("MediaStream: error reading frame: %v", err)
+			s.emitError(&StrmError{StrmUnknownCommandErr, fmt.Errorf("error reading frame: %v", err), false})
 			// we will send an idle 0s body so the connection stays open
 			if _, err = output.Write(zero4); err != nil {
-				log.Printf("MediaStream: error writing idle after src failure: %v", err)
+				s.emitError(&StrmError{
+					StrmWriteErr,
+					fmt.Errorf("MediaStream: error writing idle after src failure: %v", err),
+					true,
+				})
 				return
 			}
 			if err = output.Flush(); err != nil {
-				log.Printf("MediaStream: error flushing idle after src failure: %v", err)
+				s.emitError(&StrmError{
+					StrmWriteErr,
+					fmt.Errorf("MediaStream: error flushing idle after src failure: %v", err),
+					true,
+				})
 				return
 			}
 			continue
@@ -209,11 +241,19 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 		// If no payload is available, send idle 0s
 		if body == nil || len(body) == 0 {
 			if _, err = output.Write(zero4); err != nil {
-				log.Printf("MediaStream: error writing idle: %v", err)
+				s.emitError(&StrmError{
+					StrmWriteErr,
+					fmt.Errorf("error writing idle: %v", err),
+					true,
+				})
 				return
 			}
 			if err = output.Flush(); err != nil {
-				log.Printf("MediaStream: flush error (idle): %v", err)
+				s.emitError(&StrmError{
+					StrmWriteErr,
+					fmt.Errorf("flush error (idle): %v", err),
+					true,
+				})
 				return
 			}
 			continue
@@ -225,7 +265,11 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 
 		// Send it chunked, send it paced
 		if err = sendChunked(output, frame, s.chunkSize, s.chunkSleep); err != nil {
-			log.Printf("MediaStream: error sending chunks (idx=%d): %v", idx, err)
+			s.emitError(&StrmError{
+				StrmWriteErr,
+				fmt.Errorf("error sending chunks (idx=%d): %v", idx, err),
+				true,
+			})
 			return
 		}
 	}
@@ -241,20 +285,19 @@ func (s *MediaStream) Start() error {
 	s.listener = ln
 	s.wg.Add(1)
 	go s.acceptLoop()
-	log.Println("Media Stream started")
 	return nil
 }
 
 func (s *MediaStream) Stop(ctx context.Context) error {
-	// Signal connection accept loop to stop
-	close(s.quit)
-
-	// Close listener
-	if s.listener != nil {
-		if err := s.listener.Close(); err != nil {
-			log.Printf("[TCPService] error closing listener: %v", err)
+	s.stopOnce.Do(func() {
+		close(s.quit)
+		// Close listener
+		if s.listener != nil {
+			if err := s.listener.Close(); err != nil {
+				logging.Printf("[TCPService] error closing listener: %v", err)
+			}
 		}
-	}
+	})
 
 	// Wait for go routines to vacate
 	done := make(chan any)

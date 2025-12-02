@@ -1,4 +1,4 @@
-package main
+package net
 
 import (
 	"bytes"
@@ -73,7 +73,7 @@ func (s *ECService) decodePayload(payload []byte) (*ECResponse, error) {
 	return response, nil
 }
 
-func (s *ECService) Start() error {
+func (s *ECService) InitStreamCmd() error {
 	// Connect to EC Service
 	addr := net.JoinHostPort(s.ip, s.port)
 	conn, err := net.DialTimeout("tcp", addr, time.Second*5)

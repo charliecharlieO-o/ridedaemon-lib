@@ -1,12 +1,22 @@
-package main
+package stream
 
 import (
 	"fmt"
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+type FrameSource interface {
+	NextFrame(now time.Time) ([]byte, error)
+}
+
+type LiveSource interface {
+	FrameSource
+	IsActive(now time.Time) bool
+}
 
 var streamHeader = []byte{
 	0x02, 0x00, 0x00, 0x00,
@@ -98,7 +108,7 @@ func concatBytes(parts ...[]byte) []byte {
 	return out
 }
 
-type NoSignalSource struct {
+type FileFrameSource struct {
 	mu sync.Mutex
 
 	aus       [][]byte // AUD-delimited access units
@@ -111,9 +121,9 @@ type NoSignalSource struct {
 	streamHeader []byte        // optional SPS/PPS/etc to prepend for first poll (warmup)
 }
 
-// NewNoSignalSource loads a .h264 file, splits it into AUD-delim AUs
+// NewFileFrameSource loads a .h264 file, splits it into AUD-delim AUs
 // annex-b and creates a replay source.
-func NewNoSignalSource(path string, targetFPS int) (*NoSignalSource, error) {
+func NewFileFrameSource(path string, targetFPS int) (*FileFrameSource, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("error reading h264 file %q: %w", path, err)
@@ -129,7 +139,7 @@ func NewNoSignalSource(path string, targetFPS int) (*NoSignalSource, error) {
 	}
 
 	interval := time.Second / time.Duration(targetFPS)
-	return &NoSignalSource{
+	return &FileFrameSource{
 		aus:          aus,
 		replayIdx:    0,
 		pollCount:    0,
@@ -140,7 +150,7 @@ func NewNoSignalSource(path string, targetFPS int) (*NoSignalSource, error) {
 	}, nil
 }
 
-func (s *NoSignalSource) NextFrame(now time.Time) ([]byte, error) {
+func (s *FileFrameSource) NextFrame(now time.Time) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -421,11 +431,16 @@ func feedStreamToLiveSource(r io.Reader, src *LiveStreamSource) error {
 }
 
 type MuxSource struct {
+	stopAll  atomic.Bool
 	Live     LiveSource
 	NoSignal FrameSource
 }
 
 func (m *MuxSource) NextFrame(now time.Time) ([]byte, error) {
+	if m.stopAll.Load() {
+		return nil, nil
+	}
+	
 	// Prefer live if it's active
 	if m.Live != nil && m.Live.IsActive(now) {
 		au, err := m.Live.NextFrame(now)
@@ -440,4 +455,8 @@ func (m *MuxSource) NextFrame(now time.Time) ([]byte, error) {
 		return m.NoSignal.NextFrame(now)
 	}
 	return nil, nil
+}
+
+func (m *MuxSource) StopAllFrames() {
+	m.stopAll.Store(true)
 }

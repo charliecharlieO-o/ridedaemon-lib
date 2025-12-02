@@ -1,4 +1,4 @@
-package main
+package net
 
 import (
 	"bufio"
@@ -9,9 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"sync"
+
+	"github.com/charliecharlieO-o/ridedaemon-go/internal/logging"
 )
 
 // This protocol is not so weird, it has a 16 byte header plus payload
@@ -127,6 +128,8 @@ type PXCControl struct {
 	wg       sync.WaitGroup
 	listener net.Listener
 
+	stopOnce sync.Once
+
 	Events      chan PXCResponse
 	Errors      chan error
 	KeyPair     *KeyPair
@@ -138,10 +141,26 @@ func NewPXCControl(port string, kp *KeyPair, config *PhoneConfig) *PXCControl {
 	return &PXCControl{
 		port:        port,
 		quit:        make(chan any),
-		Events:      make(chan PXCResponse),
-		Errors:      make(chan error),
+		Events:      make(chan PXCResponse, 16),
+		Errors:      make(chan error, 16),
 		KeyPair:     kp,
 		PhoneConfig: config,
+	}
+}
+
+func (s *PXCControl) emitEvent(evt PXCResponse) {
+	select {
+	case s.Events <- evt:
+	default:
+		// channel full, drop
+	}
+}
+
+func (s *PXCControl) emitError(err error) {
+	select {
+	case s.Errors <- err:
+	default:
+		logging.Printf("Dropping error from PXC [No one's listening!]: %v", err)
 	}
 }
 
@@ -226,60 +245,65 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 	case PxcHandshake:
 		response := &PXCResponse{Command: PxcHandshakeOk}
 		if err := s.writeResponse(response, conn, nil); err != nil {
-			s.Errors <- err
+			s.emitError(&PxcError{PxcWriteErr, err, true})
 		}
 	case PxcHudConf:
 		if s.HudConfig != nil {
 			break
 		}
-		s.Events <- *event
+		s.emitEvent(*event)
 		// Read HudConfig and store it
 		var conf HUDConfig
 		if err := json.Unmarshal(event.Body, &conf); err != nil {
-			s.Errors <- err
+			s.emitError(&PxcError{PxcHudCfgErr, err, true})
+			break
 		}
 		s.HudConfig = &conf
 		// Set encrypted huid to phone config
 		if err := s.buildPC(); err != nil {
-			s.Errors <- err
+			s.emitError(&PxcError{PxcHudCfgErr, err, true})
+			break
 		}
 		// Respond with phone conf
 		if b, err := json.Marshal(s.PhoneConfig); err != nil {
-			s.Errors <- err
+			s.emitError(&PxcError{PxcHudCfgErr, err, true})
+			break
 		} else {
 			response := &PXCResponse{Command: PxcPhoneConf, Body: b}
 			if err = s.writeResponse(response, conn, nil); err != nil {
-				s.Errors <- err
+				s.emitError(&PxcError{PxcWriteErr, err, true})
 				break
 			}
-			s.Events <- *response
+			s.emitEvent(*response)
 		}
 	case PxcSpeedConf:
-		s.Events <- *event
+		s.emitEvent(*event)
 		response := &PXCResponse{Command: PxcSpeedOk}
 		if err := s.writeResponse(response, conn, nil); err != nil {
-			s.Errors <- err
+			s.emitError(&PxcError{PxcWriteErr, err, true})
 		}
 	case PxcClientSet:
-		s.Events <- *event
+		s.emitEvent(*event)
 		response := &PXCResponse{Command: PxcClientOk}
 		if err := s.writeResponse(response, conn, nil); err != nil {
-			s.Errors <- err
+			s.emitError(&PxcError{PxcWriteErr, err, true})
 		}
 	case PxcHeartbeat:
-		s.Events <- *event
+		s.emitEvent(*event) // Necessary to indicate PXC finished
 		response := &PXCResponse{Command: PxcHeartbeatOk}
 		if err := s.writeResponse(response, conn, nil); err != nil {
-			s.Errors <- err
+			s.emitError(&PxcError{PxcWriteErr, err, true})
 		}
 	default:
 		if len(event.Body) == 0 {
 			response := &PXCResponse{Command: event.Command + 1}
 			if err := s.writeResponse(response, conn, nil); err != nil {
-				s.Errors <- err
+				s.emitError(&PxcError{PxcWriteErr, err, true})
 			}
 		} else {
-			s.Errors <- fmt.Errorf("unknown event Command: %d Body: %x", event.Command, event.Body)
+			s.emitError(&PxcError{
+				PxcUnknownErr, fmt.Errorf("unknown event Command: %d Body: %x", event.Command, event.Body), true,
+			})
 		}
 	}
 }
@@ -308,12 +332,12 @@ func (s *PXCControl) acceptLoop() {
 			case <-s.quit:
 				return // Shutting down
 			default:
-				log.Printf("Error accepting connection: %v", err)
+				logging.Printf("Error accepting connection: %v", err)
 				continue
 			}
 		}
 
-		log.Printf("New PXC client from %s", conn.RemoteAddr())
+		logging.Printf("New PXC client from %s", conn.RemoteAddr())
 		s.wg.Add(1)
 		go s.handleConn(conn)
 	}
@@ -324,7 +348,7 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 	defer s.wg.Done()
 	defer func(conn net.Conn) {
 		if err := conn.Close(); err != nil {
-			log.Printf("Error closing connection: %v", err)
+			logging.Printf("Error closing connection: %v", err)
 		}
 	}(conn)
 
@@ -336,11 +360,19 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 		// Read the 16 byte header
 		headerBytes := make([]byte, pxcHeaderSize)
 		if n, err := io.ReadFull(reader, headerBytes); err != nil {
-			s.Errors <- fmt.Errorf("error reading header: %v (read %d bytes: %x)", err, n, headerBytes[:n])
+			s.emitError(&PxcError{
+				PxcDecodeErr,
+				fmt.Errorf("error reading header: %v (read %d bytes: %x)", err, n, headerBytes[:n]),
+				true,
+			})
 			return
 		}
 		if req, err := s.decodeHeader(headerBytes); err != nil {
-			s.Errors <- fmt.Errorf("error decoding header: %v", err)
+			s.emitError(&PxcError{
+				PxcDecodeErr,
+				fmt.Errorf("error decoding header: %v", err),
+				true,
+			})
 			return
 		} else {
 			request = req
@@ -348,7 +380,7 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 
 		// Sanity check
 		if request.Magic != request.Size^request.Command {
-			log.Printf("Sanity check failed: %d %d", request.Magic, request.Command)
+			logging.Printf("Sanity check failed: %d %d", request.Magic, request.Command)
 			return
 		}
 
@@ -357,7 +389,11 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 		if request.Size > 0 {
 			payload = make([]byte, request.Size-pxcHeaderSize)
 			if _, err := io.ReadFull(reader, payload); err != nil {
-				s.Errors <- fmt.Errorf("[PXCService] read payload failed from %s: %v", conn.RemoteAddr(), err)
+				s.emitError(&PxcError{
+					PxcDecodeErr,
+					fmt.Errorf("[PXCService] read payload failed from %s: %v", conn.RemoteAddr(), err),
+					true,
+				})
 				return
 			}
 			request.Body = payload
@@ -370,14 +406,14 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 
 func (s *PXCControl) Stop(ctx context.Context) error {
 	// Signal acceptLoop to stop
-	close(s.quit)
-
-	// Closing the listener will cause Accept() to error out
-	if s.listener != nil {
-		if err := s.listener.Close(); err != nil {
-			log.Printf("[TCPService] error closing listener: %v", err)
+	s.stopOnce.Do(func() {
+		close(s.quit)
+		if s.listener != nil {
+			if err := s.listener.Close(); err != nil {
+				logging.Printf("[TCPService] error closing listener: %v", err)
+			}
 		}
-	}
+	})
 
 	// Wait for all goroutines
 	done := make(chan any)
