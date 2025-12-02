@@ -2,13 +2,50 @@ package api
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/charliecharlieO-o/ridedaemon-go/hud/core"
 	"github.com/charliecharlieO-o/ridedaemon-go/hud/stream"
 	"github.com/charliecharlieO-o/ridedaemon-go/internal/logging"
 )
+
+// BuildAnnexBAUFromAVCC converts a single AVCC-formatted sample (one frame's worth of NAL units) into a single Annex-B AU.
+// It assumes 4-byte big-endian NAL lengths.
+func BuildAnnexBAUFromAVCC(avcc []byte) ([]byte, error) {
+	if len(avcc) < 4 {
+		return nil, fmt.Errorf("avcc sample too short")
+	}
+
+	out := make([]byte, 0, len(avcc)+32)
+
+	// Prepend an AUD NAL. We use a common AUD RBSP payload 0xF0, which most decoders ignore.
+	// Annex-B start code (4 bytes) + NAL header (0x09) + rbsp_byte
+	out = append(out, 0x00, 0x00, 0x00, 0x01, 0x09, 0xF0)
+
+	i := 0
+	for {
+		if i+4 > len(avcc) {
+			break
+		}
+		nalLen := int(binary.BigEndian.Uint32(avcc[i : i+4]))
+		i += 4
+		if nalLen == 0 || i+nalLen > len(avcc) { // Truncated / malformed sample
+			break
+		}
+
+		out = append(out, 0x00, 0x00, 0x00, 0x01) // Start code
+		out = append(out, avcc[i:i+nalLen]...)    // NAL bytes
+		i += nalLen
+	}
+
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no NAL units found in AVCC sample")
+	}
+	return out, nil
+}
 
 type CanBeFatalErr interface {
 	error
@@ -153,11 +190,22 @@ func (ms *MobileSession) StopSession() error {
 	return nil
 }
 
-func (ms *MobileSession) PushFrame(chunk []byte) {
+func (ms *MobileSession) PushFrame(avccChunk []byte) {
 	if !ms.hud.IsRunning() {
 		return
 	}
-	ms.streamer.PushChunk(chunk)
+	if len(avccChunk) == 0 {
+		return
+	}
+
+	au, err := BuildAnnexBAUFromAVCC(avccChunk)
+	if err != nil {
+		if ms.cb != nil {
+			go ms.cb.OnError("invalid AVCC: "+err.Error(), false)
+		}
+	}
+
+	ms.mux.Live.PushFrame(au) // push directly to live source
 }
 
 func (ms *MobileSession) IsRunning() bool {

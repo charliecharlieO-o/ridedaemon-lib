@@ -17,6 +17,7 @@ type FrameSource interface {
 type LiveSource interface {
 	FrameSource
 	IsActive(now time.Time) bool
+	PushFrame(au []byte)
 }
 
 var streamHeader = []byte{
