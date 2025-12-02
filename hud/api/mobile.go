@@ -12,6 +12,13 @@ import (
 	"github.com/charliecharlieO-o/ridedaemon-go/internal/logging"
 )
 
+// To make BuildAnnexBAUFromAVCC work well:
+// Configure MediaCodec so that keyframes include SPS/PPS in the sample payload.
+// That’s usually done with something like KEY_PREPEND_HEADER_TO_SYNC_FRAMES.
+// Keep GOP = 1 or 2, no B-frames (you were already planning this).
+// Then you don’t need to juggle SPS/PPS separately, they’ll appear as the first NALs in the keyframe sample, and
+// our AVCC -> Annex-B converter just wraps them in start codes and keeps them.
+
 // BuildAnnexBAUFromAVCC converts a single AVCC-formatted sample (one frame's worth of NAL units) into a single Annex-B AU.
 // It assumes 4-byte big-endian NAL lengths.
 func BuildAnnexBAUFromAVCC(avcc []byte) ([]byte, error) {
