@@ -418,8 +418,8 @@ func (hud *CfmotoHUD) StopStream(ctx context.Context) error {
 	case <-ctx.Done():
 	}
 
-	close(hud.Events)
-	close(hud.Errors)
+	// close(hud.Events) -- treat them as broadcast channels, parent must close attached routines
+	// close(hud.Errors) -- treat them as broadcast channels, parent must close attached routines
 
 	hud.stopOnce.Do(func() {
 		close(hud.stopped)

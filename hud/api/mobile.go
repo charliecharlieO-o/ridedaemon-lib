@@ -137,13 +137,32 @@ func NewMobileSession(cfg *MobileConfig, cb MobileCallback) (*MobileSession, err
 	// Build hud session
 	ms.hud = core.NewCfmotoHUD(cfg.TargetFPS, ms.mux)
 	go func() {
-		for hErr := range ms.hud.Errors {
-			ms.relayError(hErr)
+		for {
+			select {
+			case cErr, ok := <-ms.hud.Errors:
+				if !ok {
+					// if we close Errors, this lets us exit cleanly
+					return
+				}
+				if cErr != nil {
+					ms.relayError(cErr)
+				}
+			case <-ms.hud.Done():
+				return // HUD session is over - stop relaying
+			}
 		}
 	}()
 	go func() {
-		for evt := range ms.hud.Events {
-			ms.relayEvent(evt)
+		for {
+			select {
+			case evt, ok := <-ms.hud.Events:
+				if !ok {
+					return
+				}
+				ms.relayEvent(evt)
+			case <-ms.hud.Done():
+				return
+			}
 		}
 	}()
 
