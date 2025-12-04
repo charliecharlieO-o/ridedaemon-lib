@@ -36,7 +36,7 @@ type StoppableServer interface {
 	Stop(ctx context.Context) error
 }
 
-type ecHost struct {
+type EcHost struct {
 	Ip      string
 	Port    string
 	Package string
@@ -48,7 +48,7 @@ type CfmotoHUD struct {
 	running bool
 
 	// Config
-	host        *ecHost
+	host        *EcHost
 	targetFPS   int
 	packageName string
 	phoneUUID   uuid.UUID
@@ -232,7 +232,7 @@ func (hud *CfmotoHUD) SearchForHost(ctx context.Context, timeout time.Duration) 
 
 			if ip != "" && ecPort != "" {
 				// Found what we need
-				hud.host = &ecHost{
+				hud.host = &EcHost{
 					Ip:      ip,
 					Port:    ecPort,
 					Package: packageName,
@@ -436,4 +436,15 @@ func (hud *CfmotoHUD) IsRunning() bool {
 
 func (hud *CfmotoHUD) Done() <-chan any {
 	return hud.stopped
+}
+
+func (hud *CfmotoHUD) SetHost(host *EcHost) error {
+	hud.mu.Lock()
+	defer hud.mu.Unlock()
+	if hud.running {
+		hud.mu.Unlock()
+		return errors.New("already running")
+	}
+	hud.host = host
+	return nil
 }

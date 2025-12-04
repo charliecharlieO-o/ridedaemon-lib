@@ -60,12 +60,23 @@ type CanBeFatalErr interface {
 }
 
 type MobileConfig struct {
-	StaticSignal     []byte
-	TargetFPS        int
-	StartupTimeout   time.Duration
-	TeardownTimeout  time.Duration
-	DiscoveryTimeout time.Duration
-	DiscoveryTries   int
+	StaticSignal        []byte
+	TargetFPS           int
+	StartupTimeoutSec   int
+	TeardownTimeoutSec  int
+	DiscoveryTimeoutSec int
+	DiscoveryTries      int
+}
+
+func NewMobileConfig(static []byte, fps int, startupTimeoutSec, teardownTimeoutSec, discTimeout, discTries int) *MobileConfig {
+	return &MobileConfig{
+		StaticSignal:        static,
+		TargetFPS:           fps,
+		StartupTimeoutSec:   startupTimeoutSec,
+		TeardownTimeoutSec:  teardownTimeoutSec,
+		DiscoveryTimeoutSec: discTimeout,
+		DiscoveryTries:      discTries,
+	}
 }
 
 type MobileEvent struct {
@@ -76,8 +87,22 @@ type MobileEvent struct {
 
 type MobileCallback interface {
 	OnError(msg string, fatal bool)
-	OnEvent(event MobileEvent)
+	OnEvent(time int64, t int, payload []byte)
 	OnStopped()
+}
+
+type StreamHost struct {
+	core.EcHost
+}
+
+func NewStreamHost(ip, port, pkg string) *StreamHost {
+	return &StreamHost{
+		core.EcHost{
+			Ip:      ip,
+			Port:    port,
+			Package: pkg,
+		},
+	}
 }
 
 type MobileSession struct {
@@ -91,9 +116,10 @@ type MobileSession struct {
 	stopped chan struct{}
 }
 
-func NewMobileSession(cfg MobileConfig) (*MobileSession, error) {
+func NewMobileSession(cfg *MobileConfig, cb MobileCallback) (*MobileSession, error) {
 	ms := &MobileSession{
-		cfg:     cfg,
+		cfg:     *cfg,
+		cb:      cb,
 		stopped: make(chan struct{}),
 	}
 
@@ -150,7 +176,7 @@ func (ms *MobileSession) relayEvent(evt core.HudEvent) {
 	}
 
 	if ms.cb != nil {
-		go ms.cb.OnEvent(mobEvt)
+		go ms.cb.OnEvent(mobEvt.Time, mobEvt.Type, mobEvt.Payload)
 	}
 }
 
@@ -163,25 +189,35 @@ func (ms *MobileSession) watchHud() {
 	close(ms.stopped)
 }
 
-func (ms *MobileSession) discoverHost(ctx context.Context) error {
+// DiscoverHost uses zeroconf to search for the mDNS service, use only if SELinux or the mobile OS allows for it
+func (ms *MobileSession) DiscoverHost() error {
+	ctxWithTimeout, cancel := context.WithTimeout(context.Background(), time.Duration(ms.cfg.StartupTimeoutSec)*time.Second)
+	defer cancel()
+
 	tries := 0
 	for tries < ms.cfg.DiscoveryTries {
 		tries++
-		if err := ms.hud.SearchForHost(ctx, ms.cfg.DiscoveryTimeout); err != nil {
-			logging.Printf("Error discovering host: %v\n", err)
+		if err := ms.hud.SearchForHost(ctxWithTimeout, time.Duration(ms.cfg.DiscoveryTimeoutSec)*time.Second); err != nil {
+			logging.Printf("error discovering host: %v\n", err)
+			return err
 		} else {
 			return nil
 		}
 	}
+
 	return errors.New("discovery timed out")
 }
 
-func (ms *MobileSession) StartSession() error {
-	ctxWithTimeout, cancel := context.WithTimeout(context.Background(), ms.cfg.StartupTimeout)
-	defer cancel()
-	if err := ms.discoverHost(ctxWithTimeout); err != nil {
+func (ms *MobileSession) SetECHost(host *StreamHost) error {
+	if err := ms.hud.SetHost(&host.EcHost); err != nil {
 		return err
 	}
+	return nil
+}
+
+func (ms *MobileSession) StartSession() error {
+	ctxWithTimeout, cancel := context.WithTimeout(context.Background(), time.Duration(ms.cfg.StartupTimeoutSec)*time.Second)
+	defer cancel()
 	if err := ms.hud.StartStream(ctxWithTimeout); err != nil {
 		return err
 	}
@@ -189,7 +225,7 @@ func (ms *MobileSession) StartSession() error {
 }
 
 func (ms *MobileSession) StopSession() error {
-	ctxWithTimeout, cancel := context.WithTimeout(context.Background(), ms.cfg.TeardownTimeout)
+	ctxWithTimeout, cancel := context.WithTimeout(context.Background(), time.Duration(ms.cfg.TeardownTimeoutSec)*time.Second)
 	defer cancel()
 	if err := ms.hud.StopStream(ctxWithTimeout); err != nil {
 		return err
