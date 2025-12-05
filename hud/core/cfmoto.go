@@ -396,6 +396,7 @@ func (hud *CfmotoHUD) StopStream(ctx context.Context) error {
 	var wg sync.WaitGroup
 	servers := []StoppableServer{mediaStream, mediaCtrl, pxc}
 
+	logging.Printf("Stopping stream servers")
 	for _, server := range servers {
 		if server == nil {
 			continue
@@ -421,6 +422,7 @@ func (hud *CfmotoHUD) StopStream(ctx context.Context) error {
 	// close(hud.Events) -- treat them as broadcast channels, parent must close attached routines
 	// close(hud.Errors) -- treat them as broadcast channels, parent must close attached routines
 
+	logging.Printf("signaling hud stopped")
 	hud.stopOnce.Do(func() {
 		close(hud.stopped)
 	})

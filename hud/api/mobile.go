@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -52,6 +53,25 @@ func BuildAnnexBAUFromAVCC(avcc []byte) ([]byte, error) {
 		return nil, fmt.Errorf("no NAL units found in AVCC sample")
 	}
 	return out, nil
+}
+
+func BuildAnnexBAU(sample []byte) ([]byte, error) {
+	if len(sample) < 4 {
+		return nil, fmt.Errorf("sample too short")
+	}
+
+	// 1) Detect Annex-B: start code at beginning
+	if bytes.HasPrefix(sample, []byte{0x00, 0x00, 0x00, 0x01}) ||
+		bytes.HasPrefix(sample, []byte{0x00, 0x00, 0x01}) {
+		out := make([]byte, 0, len(sample)+16)
+		// prepend AUD
+		out = append(out, 0x00, 0x00, 0x00, 0x01, 0x09, 0xF0)
+		out = append(out, sample...)
+		return out, nil
+	}
+
+	// 2) Otherwise, assume AVCC (4-byte lengths)
+	return BuildAnnexBAUFromAVCC(sample)
 }
 
 type CanBeFatalErr interface {
@@ -246,6 +266,7 @@ func (ms *MobileSession) StartSession() error {
 func (ms *MobileSession) StopSession() error {
 	ctxWithTimeout, cancel := context.WithTimeout(context.Background(), time.Duration(ms.cfg.TeardownTimeoutSec)*time.Second)
 	defer cancel()
+	logging.Printf("Stopping session\n")
 	if err := ms.hud.StopStream(ctxWithTimeout); err != nil {
 		return err
 	}
@@ -260,14 +281,16 @@ func (ms *MobileSession) PushFrame(avccChunk []byte) {
 		return
 	}
 
-	au, err := BuildAnnexBAUFromAVCC(avccChunk)
+	au, err := BuildAnnexBAU(avccChunk)
 	if err != nil {
 		if ms.cb != nil {
 			go ms.cb.OnError("invalid AVCC: "+err.Error(), false)
 		}
+		logging.Printf("MobileSession: invalid AVCC: %v\n", err)
+		return
 	}
 
-	ms.mux.Live.PushFrame(au) // push directly to live source
+	ms.mux.Live.PushFrame(au)
 }
 
 func (ms *MobileSession) IsRunning() bool {

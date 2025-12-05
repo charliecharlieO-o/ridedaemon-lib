@@ -122,11 +122,11 @@ type PhoneConfig struct {
 }
 
 type PXCControl struct {
-	port string
-	quit chan any
-
+	port     string
+	quit     chan any
 	wg       sync.WaitGroup
 	listener net.Listener
+	tracker  *ConnTracker
 
 	stopOnce sync.Once
 
@@ -141,6 +141,7 @@ func NewPXCControl(port string, kp *KeyPair, config *PhoneConfig) *PXCControl {
 	return &PXCControl{
 		port:        port,
 		quit:        make(chan any),
+		tracker:     NewConnTracker(),
 		Events:      make(chan PXCResponse, 16),
 		Errors:      make(chan error, 16),
 		KeyPair:     kp,
@@ -345,15 +346,17 @@ func (s *PXCControl) acceptLoop() {
 
 // Handling a single TCP connection
 func (s *PXCControl) handleConn(conn net.Conn) {
-	defer s.wg.Done()
-	defer func(conn net.Conn) {
-		if err := conn.Close(); err != nil {
-			logging.Printf("Error closing connection: %v", err)
-		}
-	}(conn)
+	s.tracker.Add(conn)
+	defer func() {
+		s.tracker.Remove(conn)
+		_ = conn.Close()
+		s.wg.Done()
+	}()
 
 	reader := bufio.NewReader(conn)
 
+	logging.Printf("Starting PXC Loop")
+	defer logging.Printf("Stopping PXC Loop")
 	for {
 		var request *PXCResponse
 
@@ -405,6 +408,7 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 }
 
 func (s *PXCControl) Stop(ctx context.Context) error {
+	logging.Printf("Stopping pxc server")
 	// Signal acceptLoop to stop
 	s.stopOnce.Do(func() {
 		close(s.quit)
@@ -415,17 +419,24 @@ func (s *PXCControl) Stop(ctx context.Context) error {
 		}
 	})
 
+	// Close all tcp connections
+	s.tracker.CloseAll()
+
 	// Wait for all goroutines
 	done := make(chan any)
 	go func() {
+		logging.Printf("Waiting for PXC routines to vacate")
 		s.wg.Wait()
+		logging.Printf("PXC routines exited")
 		close(done)
 	}()
 
 	select {
 	case <-ctx.Done():
+		logging.Printf("PXC ctx timeout")
 		return ctx.Err()
 	case <-done:
+		logging.Printf("PXC stream closed through done channel")
 		if s.Errors != nil {
 			close(s.Errors)
 		}

@@ -81,6 +81,7 @@ type MediaStream struct {
 	quit     chan any
 	wg       sync.WaitGroup
 	listener net.Listener
+	tracker  *ConnTracker
 
 	stopOnce sync.Once
 
@@ -99,6 +100,7 @@ func NewMediaStream(port string, src stream.FrameSource, chunkSize int, chunkSle
 	return &MediaStream{
 		port:       port,
 		quit:       make(chan any),
+		tracker:    NewConnTracker(),
 		Errors:     make(chan error, 16),
 		src:        src,
 		chunkSize:  chunkSize,
@@ -137,12 +139,12 @@ func (s *MediaStream) acceptLoop() {
 
 // Handling individual TCP Connection/Client
 func (s *MediaStream) handleConn(conn net.Conn) {
-	defer s.wg.Done()
-	defer func(conn net.Conn) {
-		if err := conn.Close(); err != nil {
-			logging.Printf("MediaStream: Error closing connection: %v", err)
-		}
-	}(conn)
+	s.tracker.Add(conn)
+	defer func() {
+		s.tracker.Remove(conn)
+		_ = conn.Close()
+		s.wg.Done()
+	}()
 
 	// Keep a fast & stead connection
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
@@ -166,6 +168,8 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 		pollCount:    0,
 	}
 
+	logging.Printf("Starting MediaStream Loop")
+	defer logging.Printf("Stopping MediaStream Loop")
 	for {
 		// Read 8 bytes (poll header)
 		if _, err := io.ReadFull(input, header); err != nil {
@@ -289,6 +293,7 @@ func (s *MediaStream) Start() error {
 }
 
 func (s *MediaStream) Stop(ctx context.Context) error {
+	logging.Printf("Stopping media stream")
 	s.stopOnce.Do(func() {
 		close(s.quit)
 		// Close listener
@@ -299,18 +304,25 @@ func (s *MediaStream) Stop(ctx context.Context) error {
 		}
 	})
 
+	// Close all open TCP connections
+	s.tracker.CloseAll()
+
 	// Wait for go routines to vacate
 	done := make(chan any)
 	go func() {
+		logging.Printf("Waiting for Media routines to vacate")
 		s.wg.Wait()
+		logging.Printf("Media routines exited")
 		close(done)
 	}()
 
 	// Either timeout with context or go routines vacate and we close normally
 	select {
 	case <-ctx.Done():
+		logging.Printf("Media stream ctx timeout")
 		return ctx.Err()
 	case <-done:
+		logging.Printf("Media stream closed through done channel")
 		if s.Errors != nil {
 			close(s.Errors)
 		}

@@ -50,11 +50,11 @@ type View struct {
 }
 
 type MediaControl struct {
-	port string
-	quit chan any
-
+	port     string
+	quit     chan any
 	wg       sync.WaitGroup
 	listener net.Listener
+	tracker  *ConnTracker
 
 	stopOnce sync.Once
 
@@ -64,10 +64,11 @@ type MediaControl struct {
 
 func NewMediaControl(port string) *MediaControl {
 	return &MediaControl{
-		port:   port,
-		quit:   make(chan any),
-		Errors: make(chan error, 16),
-		Events: make(chan MediaCtrlResponse, 16),
+		port:    port,
+		quit:    make(chan any),
+		tracker: NewConnTracker(),
+		Errors:  make(chan error, 16),
+		Events:  make(chan MediaCtrlResponse, 16),
 	}
 }
 
@@ -198,15 +199,17 @@ func (s *MediaControl) handleEvent(event *MediaCtrlResponse, conn net.Conn) {
 
 // Handling individual TCP Connection/Client
 func (s *MediaControl) handleConn(conn net.Conn) {
-	defer s.wg.Done()
-	defer func(conn net.Conn) {
-		if err := conn.Close(); err != nil {
-			logging.Printf("Error closing connection: %v", err)
-		}
-	}(conn)
+	s.tracker.Add(conn)
+	defer func() {
+		s.tracker.Remove(conn)
+		_ = conn.Close()
+		s.wg.Done()
+	}()
 
 	reader := bufio.NewReader(conn)
 
+	logging.Printf("Starting StreamCtrl Loop")
+	defer logging.Printf("Stopping StreamCtrl Loop")
 	for {
 		var request *MediaCtrlResponse
 
@@ -268,6 +271,7 @@ func (s *MediaControl) Start() error {
 }
 
 func (s *MediaControl) Stop(ctx context.Context) error {
+	logging.Printf("Stopping media control")
 	// Signal connection accept loop to stop
 	s.stopOnce.Do(func() {
 		close(s.quit)
@@ -279,18 +283,25 @@ func (s *MediaControl) Stop(ctx context.Context) error {
 		}
 	})
 
+	// Close all tcp connections
+	s.tracker.CloseAll()
+
 	// Wait for go routines to vacate
 	done := make(chan any)
 	go func() {
+		logging.Printf("Waiting for Stream Ctrl routines to vacate")
 		s.wg.Wait()
+		logging.Printf("Stream Ctrl routines vacated")
 		close(done)
 	}()
 
 	// Either timeout with context or go routines vacate and we close normally
 	select {
 	case <-ctx.Done():
+		logging.Printf("Stream Ctrl ctx timeout")
 		return ctx.Err()
 	case <-done:
+		logging.Printf("Stream Ctrl closed through done channel")
 		if s.Errors != nil {
 			close(s.Errors)
 		}
