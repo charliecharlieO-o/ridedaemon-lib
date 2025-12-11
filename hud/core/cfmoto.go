@@ -108,14 +108,14 @@ func (hud *CfmotoHUD) handleServerEvent(evt any) {
 	now := time.Now()
 	hudEvent := HudEvent{Source: UnknownEventSource, Time: now, Data: evt}
 	switch e := evt.(type) {
-	case *net.PXCResponse:
+	case net.PXCResponse:
 		if e.Command == net.PxcHeartbeat {
 			break
 		}
 		hudEvent.Source = EventSourcePXC
 		hudEvent.Cmd = int(e.Command)
 		hudEvent.Data = e.Body
-	case *net.MediaCtrlResponse:
+	case net.MediaCtrlResponse:
 		hudEvent.Source = EventSourceMediaControl
 		hudEvent.Cmd = int(e.Command)
 		hudEvent.Data = e.Payload
@@ -420,7 +420,6 @@ func (hud *CfmotoHUD) StopStream(ctx context.Context) error {
 	}
 
 	// close(hud.Events) -- treat them as broadcast channels, parent must close attached routines
-	// close(hud.Errors) -- treat them as broadcast channels, parent must close attached routines
 
 	logging.Printf("signaling hud stopped")
 	hud.stopOnce.Do(func() {

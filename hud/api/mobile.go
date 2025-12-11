@@ -99,12 +99,6 @@ func NewMobileConfig(static []byte, fps int, startupTimeoutSec, teardownTimeoutS
 	}
 }
 
-type MobileEvent struct {
-	Time    int64 // millis for mobile
-	Type    int
-	Payload []byte
-}
-
 type MobileCallback interface {
 	OnError(msg string, fatal bool)
 	OnEvent(time int64, t int, payload []byte)
@@ -206,16 +200,16 @@ func (ms *MobileSession) relayError(err error) {
 }
 
 func (ms *MobileSession) relayEvent(evt core.HudEvent) {
-	mobEvt := MobileEvent{
-		Time: time.Now().UnixMilli(),
-		Type: evt.Cmd,
-	}
+	timestamp := time.Now().UnixMilli()
+	src := int(evt.Source)
+
+	var payload []byte
 	if dta, ok := evt.Data.([]byte); ok {
-		mobEvt.Payload = append([]byte(nil), dta...)
+		payload = append([]byte(nil), dta...)
 	}
 
 	if ms.cb != nil {
-		go ms.cb.OnEvent(mobEvt.Time, mobEvt.Type, mobEvt.Payload)
+		go ms.cb.OnEvent(timestamp, src, payload)
 	}
 }
 

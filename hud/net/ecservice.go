@@ -58,7 +58,7 @@ func (s *ECService) decodePayload(payload []byte) (*ECResponse, error) {
 	// Sanity check there's a newline defining the end of the payload
 	newlineIdx := bytes.IndexByte(body, '\n')
 	if newlineIdx == -1 {
-		return nil, fmt.Errorf("now newline terminator found (0x0a)")
+		return nil, fmt.Errorf("no newline terminator found (0x0a)")
 	}
 
 	// Process header
