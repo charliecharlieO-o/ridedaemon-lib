@@ -141,7 +141,7 @@ endorsed by CFMoto. Contributions and protocol corrections are welcome.
 
 ## License
 
-GPL-3.0. See [LICENSE](LICENSE).
+GPL-3.0. See [LICENSE.md](LICENSE).
 
 In short:
 
@@ -158,4 +158,4 @@ In short:
 - Sublicense it under different, more restrictive terms.
 
 This is a plain-language summary, not a substitute for the license text.
-The [LICENSE](LICENSE) file is what actually governs.
+The [LICENSE.md](LICENSE) file is what actually governs.
