@@ -1,4 +1,4 @@
-# Ridedaemon
+# Ridedaemon Lib
 
 A Go implementation of the phone-mirroring protocol used by CFMoto's in-dash
 infotainment/HUD units to receive a live video feed from a paired phone.
