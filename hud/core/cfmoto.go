@@ -351,6 +351,7 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn) (er
 	}
 
 	mediaControl := net.NewMediaControl(":10921")
+	mediaControl.OnVideoStart = hud.muxSource.PrepareLiveConsumer
 	// -- maybe we could change chunkStep to something smaller to reduce latency?
 	mediaStream := net.NewMediaStream(":10920", hud.muxSource, 0x1000, 3*time.Millisecond)
 

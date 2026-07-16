@@ -18,6 +18,7 @@ type LiveSource interface {
 	FrameSource
 	IsActive(now time.Time) bool
 	PushFrame(au []byte)
+	PrepareForConsumer()
 }
 
 var streamHeader = []byte{
@@ -238,6 +239,7 @@ type LiveStreamSource struct {
 	active      bool
 	lastInput   time.Time
 	liveTimeout time.Duration
+	awaitIDR    bool
 }
 
 func NewLiveStreamSource(targetFPS int, liveTimeout time.Duration, maxQ int) *LiveStreamSource {
@@ -259,6 +261,7 @@ func NewLiveStreamSource(targetFPS int, liveTimeout time.Duration, maxQ int) *Li
 		active:      false,
 		lastInput:   time.Time{},
 		liveTimeout: liveTimeout,
+		awaitIDR:    true,
 	}
 }
 
@@ -274,6 +277,12 @@ func (s *LiveStreamSource) PushFrame(au []byte) {
 	now := time.Now()
 	s.active = true
 	s.lastInput = now
+	if s.awaitIDR {
+		if !hasAnnexBNALType(au, 5) {
+			return
+		}
+		s.awaitIDR = false
+	}
 
 	if s.count == s.capacity {
 		// Drop the oldest frame
@@ -287,6 +296,22 @@ func (s *LiveStreamSource) PushFrame(au []byte) {
 	s.aus[s.tail] = buf
 	s.tail = (s.tail + 1) % s.capacity
 	s.count++
+}
+
+// PrepareForConsumer clears stale predictive frames and waits for a fresh IDR.
+func (s *LiveStreamSource) PrepareForConsumer() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for i := range s.aus {
+		s.aus[i] = nil
+	}
+	s.count = 0
+	s.head = 0
+	s.tail = 0
+	s.lastAU = nil
+	s.lastAdvance = time.Time{}
+	s.awaitIDR = true
 }
 
 func (s *LiveStreamSource) IsActive(now time.Time) bool {
@@ -311,6 +336,29 @@ func (s *LiveStreamSource) resetLocked() {
 	s.count = 0
 	s.head = 0
 	s.tail = 0
+	s.awaitIDR = true
+}
+
+func hasAnnexBNALType(data []byte, wanted byte) bool {
+	for i := 0; i+3 < len(data); {
+		startCodeLen := 0
+		if data[i] == 0 && data[i+1] == 0 && data[i+2] == 1 {
+			startCodeLen = 3
+		} else if i+4 < len(data) && data[i] == 0 && data[i+1] == 0 &&
+			data[i+2] == 0 && data[i+3] == 1 {
+			startCodeLen = 4
+		}
+		if startCodeLen == 0 {
+			i++
+			continue
+		}
+		nalIndex := i + startCodeLen
+		if nalIndex < len(data) && data[nalIndex]&0x1f == wanted {
+			return true
+		}
+		i = nalIndex + 1
+	}
+	return false
 }
 
 // NextFrame fits our FrameSource interface's NextFrame signature.
@@ -487,4 +535,10 @@ func (m *MuxSource) NextFrame(now time.Time) ([]byte, error) {
 
 func (m *MuxSource) StopAllFrames() {
 	m.stopAll.Store(true)
+}
+
+func (m *MuxSource) PrepareLiveConsumer() {
+	if m.Live != nil {
+		m.Live.PrepareForConsumer()
+	}
 }

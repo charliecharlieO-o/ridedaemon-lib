@@ -2,6 +2,8 @@ package net
 
 import (
 	"encoding/binary"
+	"io"
+	"net"
 	"testing"
 )
 
@@ -27,6 +29,31 @@ func TestMediaCaptureAckPreservesLegacyNegotiation(t *testing.T) {
 
 func TestMediaCaptureAckFallsBackForMissingPayload(t *testing.T) {
 	assertMediaCaptureAck(t, buildMediaCaptureAckPayload(nil), 2, 800, 384, 1)
+}
+
+func TestMediaStartPreparesConsumerBeforeAcknowledgement(t *testing.T) {
+	control := NewMediaControl(":0")
+	prepared := false
+	control.OnVideoStart = func() { prepared = true }
+	server, client := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		control.handleEvent(&MediaCtrlResponse{Command: MediaCtrlChk}, server)
+		close(done)
+	}()
+
+	header := make([]byte, mediaCtrlHeaderSize)
+	if _, err := io.ReadFull(client, header); err != nil {
+		t.Fatalf("read media start acknowledgement: %v", err)
+	}
+	if !prepared {
+		t.Fatal("consumer was not prepared before media start acknowledgement")
+	}
+	if command := binary.LittleEndian.Uint16(header[0:2]); command != MediaCtrlRcv {
+		t.Fatalf("media start acknowledgement command = %d, want %d", command, MediaCtrlRcv)
+	}
+	_ = client.Close()
+	<-done
 }
 
 func assertMediaCaptureAck(

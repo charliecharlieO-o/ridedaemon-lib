@@ -57,8 +57,9 @@ type MediaControl struct {
 
 	stopOnce sync.Once
 
-	Errors chan error
-	Events chan MediaCtrlResponse
+	Errors       chan error
+	Events       chan MediaCtrlResponse
+	OnVideoStart func()
 }
 
 func NewMediaControl(port string) *MediaControl {
@@ -169,6 +170,10 @@ func (s *MediaControl) handleEvent(event *MediaCtrlResponse, conn net.Conn) {
 			break
 		}
 	case MediaCtrlChk:
+		if s.OnVideoStart != nil {
+			s.OnVideoStart()
+		}
+		s.emitEvent(*event)
 		response := &MediaCtrlResponse{Command: MediaCtrlRcv, Size: 0}
 		if err := s.writeResponse(response, conn); err != nil {
 			s.emitError(&CtrlError{CtrlWriteErr, err, true})

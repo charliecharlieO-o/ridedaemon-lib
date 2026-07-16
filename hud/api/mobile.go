@@ -142,9 +142,13 @@ func NewMobileSession(cfg *MobileConfig, cb MobileCallback) (*MobileSession, err
 	}
 
 	// Setup Sources
-	static, err := stream.NewRawFrameSource(cfg.StaticSignal, cfg.TargetFPS)
-	if err != nil {
-		return nil, err
+	var static stream.FrameSource
+	if len(cfg.StaticSignal) > 0 {
+		var err error
+		static, err = stream.NewRawFrameSource(cfg.StaticSignal, cfg.TargetFPS)
+		if err != nil {
+			return nil, err
+		}
 	}
 	live := stream.NewLiveStreamSource(cfg.TargetFPS, 3*time.Second, 3)
 	ms.mux = &stream.MuxSource{NoSignal: static, Live: live}
