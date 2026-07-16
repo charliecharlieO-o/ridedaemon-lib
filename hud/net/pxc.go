@@ -29,6 +29,12 @@ const (
 	PxcSpeedConf uint32 = 67216
 	PxcHeartbeat uint32 = 1879048192
 	PxcClientSet uint32 = 66528
+
+	// Newer CFDL26 firmware sends additional control notifications before it
+	// opens the media ports. PXC request commands are even and use cmd+1 as ACK.
+	PxcOtaFtpInfo       uint32 = 0x103a0
+	PxcMediaFeatureConf uint32 = 0x10020
+	PxcCheckSnResult    uint32 = 0x201c0
 )
 
 // Command responses
@@ -38,7 +44,22 @@ const (
 	PxcSpeedOk     uint32 = 67217
 	PxcHeartbeatOk uint32 = 1879048193
 	PxcClientOk    uint32 = 66529
+	PxcCheckSnAck  uint32 = PxcClientSet + 1
+	PxcCheckSnDone uint32 = PxcCheckSnResult + 1
 )
+
+type checkSnRequest struct {
+	ClientSet string `json:"client_set"`
+	Serial    string `json:"sn"`
+}
+
+type checkSnResult struct {
+	IsOK      bool   `json:"isOk"`
+	ErrorCode int    `json:"errCode"`
+	ErrorMsg  string `json:"errMsg"`
+	ID        string `json:"id"`
+	ClientSet string `json:"client_set"`
+}
 
 type PXCResponse struct {
 	Command uint32
@@ -285,7 +306,34 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 		}
 	case PxcClientSet:
 		s.emitEvent(*event)
-		response := &PXCResponse{Command: PxcClientOk}
+		ack := &PXCResponse{Command: PxcCheckSnAck}
+		if err := s.writeResponse(ack, conn, nil); err != nil {
+			s.emitError(&PxcError{PxcWriteErr, err, true})
+			break
+		}
+
+		var request checkSnRequest
+		if len(event.Body) > 0 {
+			if err := json.Unmarshal(event.Body, &request); err != nil {
+				s.emitError(&PxcError{PxcDecodeErr, fmt.Errorf("decode CHECK_SN: %w", err), false})
+			}
+		}
+		result := checkSnResult{
+			IsOK:      true,
+			ErrorCode: 0,
+			ErrorMsg:  "",
+			ID:        request.Serial,
+			ClientSet: request.ClientSet,
+		}
+		if result.ClientSet == "" {
+			result.ClientSet = "easy_conn"
+		}
+		body, err := json.Marshal(result)
+		if err != nil {
+			s.emitError(&PxcError{PxcWriteErr, err, true})
+			break
+		}
+		response := &PXCResponse{Command: PxcCheckSnResult, Body: body}
 		if err := s.writeResponse(response, conn, nil); err != nil {
 			s.emitError(&PxcError{PxcWriteErr, err, true})
 		}
@@ -295,16 +343,32 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 		if err := s.writeResponse(response, conn, nil); err != nil {
 			s.emitError(&PxcError{PxcWriteErr, err, true})
 		}
+	case PxcCheckSnDone:
+		// The bike acknowledges the phone-originated CHECK_SN_RESULT.
+		s.emitEvent(*event)
 	default:
-		if len(event.Body) == 0 {
+		if event.Command&1 == 0 {
+			// Unknown even commands are requests. CFDL26 uses several JSON and
+			// binary notifications here and will not open 10921/10920 until ACKed.
+			logging.Printf(
+				"Acknowledging unhandled PXC request command=0x%x bodyBytes=%d",
+				event.Command,
+				len(event.Body),
+			)
+			s.emitEvent(*event)
 			response := &PXCResponse{Command: event.Command + 1}
 			if err := s.writeResponse(response, conn, nil); err != nil {
 				s.emitError(&PxcError{PxcWriteErr, err, true})
 			}
 		} else {
-			s.emitError(&PxcError{
-				PxcUnknownErr, fmt.Errorf("unknown event Command: %d Body: %x", event.Command, event.Body), true,
-			})
+			// Unknown odd commands are responses. Never answer them, otherwise
+			// two peers using cmd+1 acknowledgements can create an ACK loop.
+			logging.Printf(
+				"Ignoring unhandled PXC response command=0x%x bodyBytes=%d",
+				event.Command,
+				len(event.Body),
+			)
+			s.emitEvent(*event)
 		}
 	}
 }

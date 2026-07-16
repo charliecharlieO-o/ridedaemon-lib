@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	stdnet "net"
 	"regexp"
 	"strconv"
 	"sync"
@@ -248,6 +249,15 @@ func (hud *CfmotoHUD) SearchForHost(ctx context.Context, timeout time.Duration) 
 }
 
 func (hud *CfmotoHUD) StartStream(ctx context.Context) (err error) {
+	return hud.startStream(ctx, nil)
+}
+
+// StartStreamWithInitConn starts the regular HUD servers after using a caller-routed EC handshake.
+func (hud *CfmotoHUD) StartStreamWithInitConn(ctx context.Context, initConn stdnet.Conn) (err error) {
+	return hud.startStream(ctx, initConn)
+}
+
+func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn) (err error) {
 	hud.mu.Lock()
 	if hud.running {
 		hud.mu.Unlock()
@@ -271,7 +281,12 @@ func (hud *CfmotoHUD) StartStream(ctx context.Context) (err error) {
 	hud.ecService = net.NewECService(
 		hud.host.Ip, hud.host.Port, hud.host.Package, hud.phoneConfig.PhoneOs,
 	)
-	if err = hud.ecService.InitStreamCmd(); err != nil {
+	if initConn != nil {
+		err = hud.ecService.InitStreamCmdWithConn(initConn)
+	} else {
+		err = hud.ecService.InitStreamCmd()
+	}
+	if err != nil {
 		hud.ecService = nil
 		return err
 	}
@@ -376,6 +391,9 @@ func (hud *CfmotoHUD) StopStream(ctx context.Context) error {
 	hud.mu.Lock()
 	if !hud.running {
 		hud.mu.Unlock()
+		hud.stopOnce.Do(func() {
+			close(hud.stopped)
+		})
 		return nil
 	}
 
@@ -443,7 +461,6 @@ func (hud *CfmotoHUD) SetHost(host *EcHost) error {
 	hud.mu.Lock()
 	defer hud.mu.Unlock()
 	if hud.running {
-		hud.mu.Unlock()
 		return errors.New("already running")
 	}
 	hud.host = host
