@@ -252,7 +252,7 @@ func (hud *CfmotoHUD) StartStream(ctx context.Context) (err error) {
 	return hud.startStream(ctx, nil)
 }
 
-// StartStreamWithInitConn starts the regular HUD servers after using a caller-routed EC handshake.
+// StartStreamWithInitConn opens the reverse HUD servers before using a caller-routed EC handshake.
 func (hud *CfmotoHUD) StartStreamWithInitConn(ctx context.Context, initConn stdnet.Conn) (err error) {
 	return hud.startStream(ctx, initConn)
 }
@@ -274,20 +274,6 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn) (er
 	hud.mu.Unlock()
 
 	if hud.keyPair, err = net.GenKeyPair(); err != nil {
-		return err
-	}
-
-	logging.Printf("Sending EC stream init command")
-	hud.ecService = net.NewECService(
-		hud.host.Ip, hud.host.Port, hud.host.Package, hud.phoneConfig.PhoneOs,
-	)
-	if initConn != nil {
-		err = hud.ecService.InitStreamCmdWithConn(initConn)
-	} else {
-		err = hud.ecService.InitStreamCmd()
-	}
-	if err != nil {
-		hud.ecService = nil
 		return err
 	}
 
@@ -337,19 +323,6 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn) (er
 	}()
 	// hud.startPxcEventFwd(pxcServer) -- uncomment for testing only, too slow!
 
-	if err = pxcServer.Start(); err != nil {
-		return fmt.Errorf("start pxc error: %w", err)
-	}
-	started = append(started, pxcServer)
-
-	// IS PXC on or has the context expired (exit on ctx done)?
-	select {
-	case <-pxcReady:
-		break
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-
 	mediaControl := net.NewMediaControl(":10921")
 	mediaControl.OnVideoStart = hud.muxSource.PrepareLiveConsumer
 	// -- maybe we could change chunkStep to something smaller to reduce latency?
@@ -368,15 +341,29 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn) (er
 	}()
 	hud.startMediaEventFwd(mediaControl)
 
-	if err = mediaStream.Start(); err != nil {
-		return fmt.Errorf("start media stream error: %w", err)
+	servers := []StoppableServer{pxcServer, mediaStream, mediaControl}
+	started, err = startReverseServersThenInit(servers, func() error {
+		logging.Printf("Reverse HUD servers are listening; sending EC stream init command")
+		hud.ecService = net.NewECService(
+			hud.host.Ip, hud.host.Port, hud.host.Package, hud.phoneConfig.PhoneOs,
+		)
+		if initConn != nil {
+			return hud.ecService.InitStreamCmdWithConn(initConn)
+		}
+		return hud.ecService.InitStreamCmd()
+	})
+	if err != nil {
+		hud.ecService = nil
+		return err
 	}
-	started = append(started, mediaStream)
 
-	if err = mediaControl.Start(); err != nil {
-		return fmt.Errorf("start media server error: %w", err)
+	// Wait until the T-Box has completed the reverse PXC handshake.
+	select {
+	case <-pxcReady:
+		break
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	started = append(started, mediaControl)
 
 	hud.mu.Lock()
 	hud.pxcControl = pxcServer
@@ -386,6 +373,22 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn) (er
 	hud.mu.Unlock()
 
 	return nil
+}
+
+func startReverseServersThenInit(
+	servers []StoppableServer,
+	initStream func() error,
+) (started []StoppableServer, err error) {
+	for index, server := range servers {
+		if err = server.Start(); err != nil {
+			return started, fmt.Errorf("start reverse server %d (%T): %w", index, server, err)
+		}
+		started = append(started, server)
+	}
+	if err = initStream(); err != nil {
+		return started, fmt.Errorf("initialize EasyConn stream: %w", err)
+	}
+	return started, nil
 }
 
 func (hud *CfmotoHUD) StopStream(ctx context.Context) error {
