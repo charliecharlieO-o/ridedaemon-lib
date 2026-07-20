@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -58,8 +57,9 @@ type MediaControl struct {
 
 	stopOnce sync.Once
 
-	Errors chan error
-	Events chan MediaCtrlResponse
+	Errors       chan error
+	Events       chan MediaCtrlResponse
+	OnVideoStart func()
 }
 
 func NewMediaControl(port string) *MediaControl {
@@ -145,14 +145,9 @@ func (s *MediaControl) handleEvent(event *MediaCtrlResponse, conn net.Conn) {
 	switch event.Command {
 	case MediaCtrlInit:
 		s.emitEvent(*event)
-		hexPayload := "020000002003800101"
-		bytes, err := hex.DecodeString(hexPayload)
-		if err != nil {
-			s.emitError(&CtrlError{CtrlDecodeErr, err, true})
-			break
-		}
-		response := &MediaCtrlResponse{Command: MediaCtrlAck, Size: uint16(len(bytes)), Payload: bytes}
-		if err = s.writeResponse(response, conn); err != nil {
+		payload := buildMediaCaptureAckPayload(event.Payload)
+		response := &MediaCtrlResponse{Command: MediaCtrlAck, Size: uint16(len(payload)), Payload: payload}
+		if err := s.writeResponse(response, conn); err != nil {
 			s.emitError(&CtrlError{CtrlWriteErr, err, true})
 			break
 		}
@@ -175,6 +170,10 @@ func (s *MediaControl) handleEvent(event *MediaCtrlResponse, conn net.Conn) {
 			break
 		}
 	case MediaCtrlChk:
+		if s.OnVideoStart != nil {
+			s.OnVideoStart()
+		}
+		s.emitEvent(*event)
 		response := &MediaCtrlResponse{Command: MediaCtrlRcv, Size: 0}
 		if err := s.writeResponse(response, conn); err != nil {
 			s.emitError(&CtrlError{CtrlWriteErr, err, true})
@@ -195,6 +194,46 @@ func (s *MediaControl) handleEvent(event *MediaCtrlResponse, conn net.Conn) {
 			break
 		}
 	}
+}
+
+func buildMediaCaptureAckPayload(request []byte) []byte {
+	encoder := uint32(2)
+	width := uint16(800)
+	height := uint16(384)
+	extendedProtocol := byte(1)
+
+	if len(request) >= 4 {
+		requestedWidth := binary.LittleEndian.Uint16(request[0:2])
+		requestedHeight := binary.LittleEndian.Uint16(request[2:4])
+		if aligned := requestedWidth &^ 0x0f; aligned >= 16 {
+			width = aligned
+		}
+		if aligned := requestedHeight &^ 0x0f; aligned >= 16 {
+			height = aligned
+		}
+	}
+	if len(request) >= 12 {
+		if requestedEncoder := binary.LittleEndian.Uint32(request[8:12]); requestedEncoder != 0 {
+			encoder = requestedEncoder
+		}
+	}
+	if len(request) >= 30 {
+		extendedProtocol = request[29]
+	}
+
+	payload := make([]byte, 9)
+	binary.LittleEndian.PutUint32(payload[0:4], encoder)
+	binary.LittleEndian.PutUint16(payload[4:6], width)
+	binary.LittleEndian.PutUint16(payload[6:8], height)
+	payload[8] = extendedProtocol
+	logging.Printf(
+		"Media capture negotiated encoder=%d width=%d height=%d extended=%d",
+		encoder,
+		width,
+		height,
+		extendedProtocol,
+	)
+	return payload
 }
 
 // Handling individual TCP Connection/Client

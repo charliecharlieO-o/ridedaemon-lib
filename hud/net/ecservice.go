@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"time"
@@ -62,10 +63,10 @@ func (s *ECService) decodePayload(payload []byte) (*ECResponse, error) {
 	}
 
 	// Process header
-	response.Code = int(header[0])
-	response.Size = int(header[4])
-	response.Separator = uint16(header[11])
-	response.Magic = int(header[8])
+	response.Code = int(binary.LittleEndian.Uint16(header[0:2]))
+	response.Size = int(binary.LittleEndian.Uint16(header[4:6]))
+	response.Separator = binary.LittleEndian.Uint16(header[11:13])
+	response.Magic = int(binary.LittleEndian.Uint16(header[8:10]))
 
 	// Process body
 	response.Body = body[:newlineIdx]
@@ -73,13 +74,43 @@ func (s *ECService) decodePayload(payload []byte) (*ECResponse, error) {
 	return response, nil
 }
 
+// readECResponse reads one complete EC packet. A TCP read can return any prefix
+// of a packet, so the response must be assembled using the advertised length.
+func readECResponse(r io.Reader) (*ECResponse, error) {
+	header := make([]byte, 16)
+	if _, err := io.ReadFull(r, header); err != nil {
+		return nil, err
+	}
+	totalLen := int(binary.LittleEndian.Uint16(header[4:6]))
+	if totalLen < len(header) || totalLen > 64*1024 {
+		return nil, fmt.Errorf("invalid EC response length: %d", totalLen)
+	}
+	body := make([]byte, totalLen-len(header))
+	if _, err := io.ReadFull(r, body); err != nil {
+		return nil, err
+	}
+	return (&ECService{}).decodePayload(append(header, body...))
+}
+
 func (s *ECService) InitStreamCmd() error {
-	// Connect to EC Service
 	addr := net.JoinHostPort(s.ip, s.port)
 	conn, err := net.DialTimeout("tcp", addr, time.Second*5)
 	if err != nil {
 		return err
 	}
+	return s.initStreamCmd(conn)
+}
+
+// InitStreamCmdWithConn performs the normal EasyConn init handshake over a caller-owned route.
+// Android callers use this to pass a socket opened by Network.socketFactory.
+func (s *ECService) InitStreamCmdWithConn(conn net.Conn) error {
+	if conn == nil {
+		return fmt.Errorf("nil EC init connection")
+	}
+	return s.initStreamCmd(conn)
+}
+
+func (s *ECService) initStreamCmd(conn net.Conn) (err error) {
 	defer func(conn net.Conn) {
 		if err = conn.Close(); err != nil {
 			log.Println(err)
@@ -111,17 +142,9 @@ func (s *ECService) InitStreamCmd() error {
 		return fmt.Errorf("failed to write to %s: %w", s.ip, err)
 	}
 
-	// receive & decode response
-	var n int
-	buf := make([]byte, 64)
-	n, err = conn.Read(buf)
-	if err != nil {
-		return fmt.Errorf("failed to read from %s: %w", s.ip, err)
-	}
-
+	// Receive one complete response. TCP packet boundaries are not protocol boundaries.
 	var response *ECResponse
-	raw := buf[:n]
-	response, err = s.decodePayload(raw)
+	response, err = readECResponse(conn)
 	if err != nil {
 		return fmt.Errorf("failed to decode response: %w", err)
 	}

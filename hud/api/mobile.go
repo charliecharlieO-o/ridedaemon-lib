@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	stdnet "net"
+	"os"
 	"time"
 
 	"github.com/charliecharlieO-o/ridedaemon-go/hud/core"
@@ -34,6 +36,7 @@ func BuildAnnexBAUFromAVCC(avcc []byte) ([]byte, error) {
 	out = append(out, 0x00, 0x00, 0x00, 0x01, 0x09, 0xF0)
 
 	i := 0
+	nalCount := 0
 	for {
 		if i+4 > len(avcc) {
 			break
@@ -41,15 +44,16 @@ func BuildAnnexBAUFromAVCC(avcc []byte) ([]byte, error) {
 		nalLen := int(binary.BigEndian.Uint32(avcc[i : i+4]))
 		i += 4
 		if nalLen == 0 || i+nalLen > len(avcc) { // Truncated / malformed sample
-			break
+			return nil, fmt.Errorf("invalid AVCC NAL length")
 		}
 
 		out = append(out, 0x00, 0x00, 0x00, 0x01) // Start code
 		out = append(out, avcc[i:i+nalLen]...)    // NAL bytes
 		i += nalLen
+		nalCount++
 	}
 
-	if len(out) == 0 {
+	if i != len(avcc) || nalCount == 0 {
 		return nil, fmt.Errorf("no NAL units found in AVCC sample")
 	}
 	return out, nil
@@ -101,7 +105,7 @@ func NewMobileConfig(static []byte, fps int, startupTimeoutSec, teardownTimeoutS
 
 type MobileCallback interface {
 	OnError(msg string, fatal bool)
-	OnEvent(time int64, t int, payload []byte)
+	OnEvent(time int64, source int, command int, payload []byte)
 	OnStopped()
 }
 
@@ -138,9 +142,13 @@ func NewMobileSession(cfg *MobileConfig, cb MobileCallback) (*MobileSession, err
 	}
 
 	// Setup Sources
-	static, err := stream.NewRawFrameSource(cfg.StaticSignal, cfg.TargetFPS)
-	if err != nil {
-		return nil, err
+	var static stream.FrameSource
+	if len(cfg.StaticSignal) > 0 {
+		var err error
+		static, err = stream.NewRawFrameSource(cfg.StaticSignal, cfg.TargetFPS)
+		if err != nil {
+			return nil, err
+		}
 	}
 	live := stream.NewLiveStreamSource(cfg.TargetFPS, 3*time.Second, 3)
 	ms.mux = &stream.MuxSource{NoSignal: static, Live: live}
@@ -202,6 +210,7 @@ func (ms *MobileSession) relayError(err error) {
 func (ms *MobileSession) relayEvent(evt core.HudEvent) {
 	timestamp := time.Now().UnixMilli()
 	src := int(evt.Source)
+	command := evt.Cmd
 
 	var payload []byte
 	if dta, ok := evt.Data.([]byte); ok {
@@ -209,7 +218,7 @@ func (ms *MobileSession) relayEvent(evt core.HudEvent) {
 	}
 
 	if ms.cb != nil {
-		go ms.cb.OnEvent(timestamp, src, payload)
+		go ms.cb.OnEvent(timestamp, src, command, payload)
 	}
 }
 
@@ -252,6 +261,34 @@ func (ms *MobileSession) StartSession() error {
 	ctxWithTimeout, cancel := context.WithTimeout(context.Background(), time.Duration(ms.cfg.StartupTimeoutSec)*time.Second)
 	defer cancel()
 	if err := ms.hud.StartStream(ctxWithTimeout); err != nil {
+		return err
+	}
+	return nil
+}
+
+// StartSessionWithSocketFd uses an already-connected TCP socket supplied by Android.
+// The descriptor ownership is transferred to this method and is always closed here.
+func (ms *MobileSession) StartSessionWithSocketFd(fd int64) error {
+	if fd < 0 {
+		return errors.New("invalid EC init socket descriptor")
+	}
+	file := os.NewFile(uintptr(fd), "ec-init")
+	if file == nil {
+		return errors.New("unable to adopt EC init socket descriptor")
+	}
+	conn, err := stdnet.FileConn(file)
+	closeErr := file.Close()
+	if err != nil {
+		return fmt.Errorf("unable to adopt EC init socket: %w", err)
+	}
+	if closeErr != nil {
+		_ = conn.Close()
+		return fmt.Errorf("unable to release EC init descriptor: %w", closeErr)
+	}
+
+	ctxWithTimeout, cancel := context.WithTimeout(context.Background(), time.Duration(ms.cfg.StartupTimeoutSec)*time.Second)
+	defer cancel()
+	if err := ms.hud.StartStreamWithInitConn(ctxWithTimeout, conn); err != nil {
 		return err
 	}
 	return nil
