@@ -114,7 +114,25 @@ session.pushFrame(avccBytes)
 ```
 
 `MobileCallback` reports errors, protocol events, and session-stopped back
-to the app.
+to the app:
+
+```go
+type MobileCallback interface {
+    OnError(msg string, fatal bool)
+    OnEvent(time int64, source int, command int, payload []byte)
+    OnStopped()
+}
+```
+
+`source` identifies which channel the event came from (PXC, media control,
+etc), and `command` identifies the specific protocol command that triggered
+it, useful for telling apart, say, a view-config push from a heartbeat
+without parsing `payload` yourself.
+
+**Note for existing integrations:** `OnEvent` gained the `command` parameter
+in a recent update, previously it was `OnEvent(time int64, source int,
+payload []byte)`. If you implemented `MobileCallback` against an older
+build, add the extra `int` parameter and rebuild against the current AAR.
 
 ## Building
 
